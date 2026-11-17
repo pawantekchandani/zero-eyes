@@ -1,0 +1,914 @@
+#!/usr/bin/env python3
+"""Zero Eyes — read an AI coding agent's answers aloud on macOS.
+
+The shared player behind every Zero Eyes surface: the auto-read hooks, the
+macOS Services read (select text, press the shortcut), and the floating
+overlay. Speech is synthesized by Microsoft Edge's Read Aloud voice service
+through the `edge-tts` package, falling back to macOS `say` when that is
+unavailable, and played by `afplay`.
+
+    printf '%s' "text" | zero-eyes      # queue it, newest 3 wait
+    zero-eyes --now                    # one JSON line of state
+    zero-eyes --stop | --pause | --mute | --next | --previous | --replay
+    zero-eyes --rate-up | --rate-down
+
+State lives in ~/Library/Application Support/Zero Eyes; configuration in
+~/.config/zero-eyes/config. Both are per-user and private.
+"""
+import asyncio
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+STATE_DIR = os.environ.get("ZERO_EYES_STATE_DIR") or os.path.join(
+    os.path.expanduser("~/Library/Application Support"), "Zero Eyes")
+
+PID_FILE = os.path.join(STATE_DIR, "player.pid")
+AFPLAY_PID_FILE = os.path.join(STATE_DIR, "afplay.pid")
+PAUSED_FLAG = os.path.join(STATE_DIR, "paused")
+QUEUE_DIR = os.path.join(STATE_DIR, "queue")
+QUEUE_LOCK = os.path.join(STATE_DIR, "queue.lock")
+WORKER_PID_FILE = os.path.join(STATE_DIR, "worker.pid")
+DEBUG_LOG = os.path.join(STATE_DIR, "queue.log")
+HISTORY_FILE = os.path.join(STATE_DIR, "history.json")
+NOW_FILE = os.path.join(STATE_DIR, "now.json")
+NAV_FILE = os.path.join(STATE_DIR, "nav")
+CONFIG_FILE = os.path.expanduser("~/.config/zero-eyes/config")
+OVERLAY_APP = os.path.expanduser("~/Applications/Zero Eyes Overlay.app")
+
+def ensure_state_dir():
+    """State is per-user and private: create it mode 700 before first write."""
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    except OSError:
+        pass
+
+def load_config():
+    cfg = {
+        "VOICE": "en-IN-PrabhatNeural",
+        "RATE": "+0%",
+        "VOLUME": "+0%",
+        "PITCH": "+0Hz",
+        "AUTO_READ": "true",
+        "MUTED": "false",
+        # auto: Edge TTS, then macOS say; edge: Edge TTS only; say: say only.
+        "ENGINE": "auto",
+        "LANGUAGE_HINDI_VOICE": "hi-IN-MadhurNeural",
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        cfg[k.strip()] = v.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    if os.environ.get("ZERO_EYES_VOICE"):
+        cfg["VOICE"] = os.environ["ZERO_EYES_VOICE"]
+    if os.environ.get("ZERO_EYES_RATE"):
+        cfg["RATE"] = os.environ["ZERO_EYES_RATE"]
+    if os.environ.get("ZERO_EYES_ENGINE"):
+        cfg["ENGINE"] = os.environ["ZERO_EYES_ENGINE"]
+    return cfg
+
+def save_config(cfg):
+    lines = [
+        "# Zero Eyes configuration — see docs/configuration.md",
+        f'VOICE="{cfg.get("VOICE", "en-IN-PrabhatNeural")}"',
+        f'RATE="{cfg.get("RATE", "+0%")}"',
+        f'VOLUME="{cfg.get("VOLUME", "+0%")}"',
+        f'PITCH="{cfg.get("PITCH", "+0Hz")}"',
+        f'AUTO_READ="{cfg.get("AUTO_READ", "true")}"',
+        f'MUTED="{cfg.get("MUTED", "false")}"',
+        f'ENGINE="{cfg.get("ENGINE", "auto")}"'
+    ]
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+def _app_name_for(pid: int) -> str:
+    """The running app that owns this process, or "" — lsappinfo only answers
+    for an app's own processes, so tool bundles such as Python.app never match."""
+    try:
+        asn = subprocess.run(
+            ["/usr/bin/lsappinfo", "find", f"pid={pid}"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        if not asn:
+            return ""
+        info = subprocess.run(
+            ["/usr/bin/lsappinfo", "info", "-only", "name", asn],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+    except Exception:
+        return ""
+    match = re.match(r'"(.+?)"', info)
+    return match.group(1) if match else ""
+
+def frontmost_app() -> str:
+    try:
+        front = subprocess.run(
+            ["/usr/bin/lsappinfo", "front"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        if not front:
+            return ""
+        info = subprocess.run(
+            ["/usr/bin/lsappinfo", "info", "-only", "name", front],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+    except Exception:
+        return ""
+    match = re.match(r'"(.+?)"', info)
+    return match.group(1) if match else ""
+
+def _is_service_runner(name: str) -> bool:
+    """A macOS service (⌃⌥Z, the Services menu) runs under a workflow runner,
+    not under the app the text was selected in, so the runner is no answer."""
+    return any(part in name for part in (
+        "WorkflowServiceRunner", "Automator", "ServicesUIAgent",
+        "System Events", "osascript", "Zero Eyes Overlay",
+    ))
+
+def detect_origin():
+    """The app this speech came from, for the overlay's first line.
+
+    Callers may name themselves with ZERO_EYES_ORIGIN. Otherwise walk the
+    parent processes to the app bundle that owns the chain, so a Claude session
+    says Claude and a T3 session says T3 Code. A macOS service (the Services
+    menu read, ⌃⌥Z) runs in a detached shell with no app above it, so there the
+    frontmost app is the answer — the browser you selected text in.
+    """
+    named = os.environ.get("ZERO_EYES_ORIGIN", "").strip()
+    if named:
+        return named
+    pid = os.getpid()
+    for _ in range(15):
+        name = _app_name_for(pid)
+        if name and not _is_service_runner(name):
+            return name
+        if name:
+            break  # a service runner: the frontmost app is what selected the text
+        if pid <= 1:
+            break
+        try:
+            raw = subprocess.run(
+                ["/bin/ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+        except Exception:
+            break
+        if not raw.isdigit() or int(raw) <= 0:
+            break
+        pid = int(raw)
+    name = frontmost_app()
+    if name and not _is_service_runner(name):
+        return name
+    return "Read aloud"
+
+def is_muted():
+    """True while the listener has muted Zero Eyes output.
+
+    Mute is not stop and not pause: the queue keeps draining at full speed, so
+    nothing piles up behind it, and items are recorded in history as usual. The
+    only thing missing is the audio. The setting lives in the config so it
+    survives a reboot and applies to every caller (Claude Code, OpenCode, the macOS service).
+    """
+    return load_config().get("MUTED", "false").strip().lower() in ("true", "1", "yes")
+
+def toggle_mute():
+    """Flip mute; on mute, cut the audio that is already playing."""
+    cfg = load_config()
+    muted = not (cfg.get("MUTED", "false").strip().lower() in ("true", "1", "yes"))
+    cfg["MUTED"] = "true" if muted else "false"
+    save_config(cfg)
+    if muted:
+        afplay = is_playing()
+        if afplay:
+            try:
+                os.kill(afplay, signal.SIGKILL)
+            except Exception:
+                pass
+    return muted
+
+def stop_playback():
+    """Stops whatever is speaking right now."""
+    # Kill afplay directly
+    if os.path.exists(AFPLAY_PID_FILE):
+        try:
+            with open(AFPLAY_PID_FILE, "r") as f:
+                afplay_pid = int(f.read().strip())
+            os.kill(afplay_pid, signal.SIGKILL)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(AFPLAY_PID_FILE)
+            except OSError:
+                pass
+
+    # Kill wrapper python script if separate
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            if pid != os.getpid():
+                os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        finally:
+            try:
+                os.remove(PID_FILE)
+            except OSError:
+                pass
+
+    if os.path.exists(PAUSED_FLAG):
+        try:
+            os.remove(PAUSED_FLAG)
+        except OSError:
+            pass
+
+def toggle_pause():
+    """Pauses or resumes ongoing speech playback using SIGSTOP / SIGCONT."""
+    if not is_playing():
+        return False
+
+    afplay_pid = None
+    if os.path.exists(AFPLAY_PID_FILE):
+        try:
+            with open(AFPLAY_PID_FILE, "r") as f:
+                afplay_pid = int(f.read().strip())
+        except Exception:
+            pass
+
+    if not afplay_pid:
+        return False
+
+    if os.path.exists(PAUSED_FLAG):
+        # Resume
+        try:
+            os.kill(afplay_pid, signal.SIGCONT)
+            os.remove(PAUSED_FLAG)
+            return True
+        except Exception:
+            pass
+    else:
+        # Pause
+        try:
+            os.kill(afplay_pid, signal.SIGSTOP)
+            with open(PAUSED_FLAG, "w") as f:
+                f.write("1")
+            return True
+        except Exception:
+            pass
+    return False
+
+def is_playing():
+    """Checks if speech playback is currently active or paused."""
+    if os.path.exists(AFPLAY_PID_FILE):
+        try:
+            with open(AFPLAY_PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, ProcessLookupError, PermissionError):
+            try:
+                os.remove(AFPLAY_PID_FILE)
+            except OSError:
+                pass
+    return None
+
+def debug(msg: str):
+    """Per-item trace, only when EDGE_QUEUE_DEBUG is set."""
+    if not os.environ.get("EDGE_QUEUE_DEBUG"):
+        return
+    try:
+        with open(DEBUG_LOG, "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+def worker_alive():
+    """PID of the queue player, or None."""
+    if os.path.exists(WORKER_PID_FILE):
+        try:
+            with open(WORKER_PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, ProcessLookupError, PermissionError):
+            try:
+                os.remove(WORKER_PID_FILE)
+            except OSError:
+                pass
+    return None
+
+def queue_items():
+    """Queued item filenames, oldest first (the name starts with a timestamp)."""
+    if not os.path.isdir(QUEUE_DIR):
+        return []
+    try:
+        return sorted(n for n in os.listdir(QUEUE_DIR) if n.endswith(".json"))
+    except OSError:
+        return []
+
+def queue_size():
+    return len(queue_items())
+
+QUEUE_WAITING_MAX = 3
+
+def enqueue(text: str, voice: str):
+    """Queue one item, keeping only the newest QUEUE_WAITING_MAX waiting.
+
+    A finished answer is spoken only if it still has a turn soon: keeping every
+    answer made the player read them minutes late, so the oldest waiting ones
+    are dropped once three are ahead. Three and not one, because an answer that
+    arrives while another is speaking would otherwise be erased by the next
+    arrival, and back-to-back answers from two sessions would never be heard.
+    Whatever is playing is never cut off. Callers exit immediately after this.
+    """
+    os.makedirs(QUEUE_DIR, exist_ok=True)
+    name = f"{time.time_ns():020d}-{os.getpid()}-{uuid.uuid4().hex}.json"
+    path = os.path.join(QUEUE_DIR, name)
+    tmp = path + ".tmp"
+    item = {"text": text, "voice": voice, "origin": detect_origin()}
+    with open(tmp, "w") as f:
+        json.dump(item, f)
+    os.replace(tmp, path)
+    dropped = 0
+    for other in queue_items()[:-QUEUE_WAITING_MAX]:
+        try:
+            os.remove(os.path.join(QUEUE_DIR, other))
+            dropped += 1
+        except OSError:
+            pass
+    debug(f"enqueue {name} ({len(text)} chars) dropped={dropped} waiting={queue_size()}")
+
+def pop_next():
+    """Take the oldest item off the queue. Only the single worker calls this."""
+    for name in queue_items():
+        path = os.path.join(QUEUE_DIR, name)
+        try:
+            with open(path, "r") as f:
+                item = json.load(f)
+            os.remove(path)
+            return item
+        except FileNotFoundError:
+            continue
+        except Exception:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    return None
+
+def clear_queue():
+    for name in queue_items():
+        try:
+            os.remove(os.path.join(QUEUE_DIR, name))
+        except OSError:
+            pass
+
+def load_history():
+    """Items already played, in order, plus which one is current."""
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            data = json.load(f)
+        items = [i for i in data.get("items", []) if isinstance(i, dict) and i.get("text")]
+        cursor = int(data.get("cursor", len(items) - 1))
+    except Exception:
+        items = []
+        cursor = -1
+    if not items:
+        return {"items": [], "cursor": -1}
+    cursor = max(0, min(cursor, len(items) - 1))
+    return {"items": items, "cursor": cursor}
+
+def save_history(history):
+    tmp = HISTORY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(history, f)
+    os.replace(tmp, HISTORY_FILE)
+
+def record_play(item):
+    """Add an item to history, dropping anything after a rewind."""
+    history = load_history()
+    items = history["items"][: history["cursor"] + 1] if history["cursor"] >= 0 else []
+    items.append({"text": item["text"], "voice": item.get("voice") or "",
+                  "origin": item.get("origin") or "Read aloud"})
+    if len(items) > 50:
+        items = items[-50:]
+    history = {"items": items, "cursor": len(items) - 1}
+    save_history(history)
+    return history
+
+def write_now(item, index, total):
+    tmp = NOW_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({
+            "text": " ".join(item["text"].split())[:160],
+            "origin": item.get("origin") or "",
+            "index": index,
+            "total": total,
+        }, f)
+    os.replace(tmp, NOW_FILE)
+
+def clear_now():
+    try:
+        os.remove(NOW_FILE)
+    except OSError:
+        pass
+
+def set_nav(direction):
+    with open(NAV_FILE, "w") as f:
+        f.write(direction)
+
+def take_nav():
+    try:
+        with open(NAV_FILE, "r") as f:
+            direction = f.read().strip()
+        os.remove(NAV_FILE)
+    except Exception:
+        return None
+    return direction if direction in ("next", "prev", "replay") else None
+
+def busy():
+    return bool(is_playing() or worker_alive() or queue_size() > 0)
+
+def navigate(direction):
+    """Queue a next/previous/replay move; the worker performs it."""
+    if direction == "prev" and not load_history()["items"] and not busy():
+        return False
+    set_nav(direction)
+    # SIGKILL works even when afplay is paused with SIGSTOP.
+    afplay = is_playing()
+    if afplay:
+        try:
+            os.kill(afplay, signal.SIGKILL)
+        except Exception:
+            pass
+    ensure_worker()
+    return True
+
+def adjust_rate(delta):
+    """Move the configured Edge rate by `delta` percent, clamped."""
+    cfg = load_config()
+    match = re.match(r'^([+-]?)(\d+)%$', cfg.get("RATE", "+0%").strip())
+    value = int(match.group(2)) * (-1 if match.group(1) == "-" else 1) if match else 0
+    value = max(-50, min(100, value + delta))
+    cfg["RATE"] = f"{value:+d}%"
+    save_config(cfg)
+    return cfg["RATE"]
+
+def now_state():
+    """One JSON line for the overlay: what is playing and how to draw it."""
+    cfg = load_config()
+    history = load_history()
+    try:
+        with open(NOW_FILE, "r") as f:
+            now = json.load(f)
+    except Exception:
+        now = {}
+    if os.path.exists(PAUSED_FLAG):
+        state = "paused"
+    elif busy():
+        state = "playing"
+    else:
+        state = "idle"
+    return {
+        "state": state,
+        "text": now.get("text", ""),
+        "origin": now.get("origin", ""),
+        "index": now.get("index", 0),
+        "total": now.get("total", len(history["items"])),
+        "queue": queue_size(),
+        "rate": cfg.get("RATE", "+0%"),
+        "voice": cfg.get("VOICE", ""),
+        "muted": is_muted(),
+    }
+
+def cancel():
+    """Stop the player and drop everything waiting behind it."""
+    pid = worker_alive()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+        # Let the worker kill afplay and release the lock before forcing it.
+        for _ in range(10):
+            if not worker_alive():
+                break
+            time.sleep(0.05)
+        pid = worker_alive()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+        try:
+            os.remove(WORKER_PID_FILE)
+        except OSError:
+            pass
+    stop_playback()
+    clear_queue()
+    try:
+        os.remove(NAV_FILE)
+    except OSError:
+        pass
+    clear_now()
+
+def ensure_worker():
+    """Start a queue player if none is running. The lock inside drain() makes
+    this safe: losers of the race exit immediately."""
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "--drain"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+
+def ensure_overlay():
+    """Show the floating controls whenever anything is about to be spoken.
+
+    Every caller (Claude Code, OpenCode, the macOS Services read, the
+    overlay's own buttons) ends up here, so the controls appear no matter who
+    starts the speech. At login the LaunchAgent starts them even before that.
+
+    The binary is exec'd directly: LaunchServices refuses to `open` an ad-hoc
+    signed local app on macOS 27 (error -10825), while a direct launch works.
+    """
+    if not os.path.isdir(OVERLAY_APP):
+        return
+    try:
+        running = subprocess.run(
+            ["/usr/bin/pgrep", "-f", "ReadAloudOverlay"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).returncode == 0
+    except Exception:
+        running = False
+    if running:
+        return
+    try:
+        subprocess.Popen(
+            [os.path.join(OVERLAY_APP, "Contents", "MacOS", "ReadAloudOverlay")],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        pass
+
+def play_item(item, cfg):
+    # Muted: skip synthesis and audio, but still consume the item, so the queue
+    # drains instead of growing into a backlog of unheard answers.
+    if is_muted():
+        return
+    try:
+        asyncio.run(speak_text(
+            item["text"],
+            item.get("voice") or cfg["VOICE"],
+            cfg["RATE"],
+            cfg["VOLUME"],
+            cfg["PITCH"],
+            cfg.get("ENGINE", "auto"),
+        ))
+    except Exception:
+        pass
+
+def drain():
+    """Play queued items in arrival order, one at a time."""
+    ensure_state_dir()
+    cfg = load_config()
+
+    lock = open(QUEUE_LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return
+
+    with open(WORKER_PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    ensure_overlay()
+    debug(f"worker {os.getpid()} start waiting={queue_size()}")
+
+    try:
+        while True:
+            nav = take_nav()
+            history = None
+            if nav in ("prev", "next", "replay"):
+                history = load_history()
+                if history["items"]:
+                    if nav == "prev":
+                        history["cursor"] = max(0, history["cursor"] - 1)
+                        save_history(history)
+                    elif nav == "next" and history["cursor"] + 1 < len(history["items"]):
+                        history["cursor"] += 1
+                        save_history(history)
+                    elif nav == "next":
+                        history = None  # nothing forward: take the next queued item
+                    if history is not None:
+                        item = history["items"][history["cursor"]]
+                        write_now(item, history["cursor"], len(history["items"]))
+                        debug(f"worker {os.getpid()} {nav} ({item['text'][:40]!r})")
+                        play_item(item, cfg)
+                        clear_now()
+                        continue
+                elif nav != "next":
+                    continue
+
+            item = pop_next()
+            if not item:
+                break
+            history = record_play(item)
+            write_now(item, history["cursor"], len(history["items"]))
+            debug(f"worker {os.getpid()} play waiting={queue_size()} ({item['text'][:40]!r})")
+            play_item(item, cfg)
+            clear_now()
+    finally:
+        clear_now()
+        try:
+            os.remove(WORKER_PID_FILE)
+        except OSError:
+            pass
+        lock.close()
+        debug(f"worker {os.getpid()} exit waiting={queue_size()}")
+
+def clean_text_for_speech(text: str) -> str:
+    """Sanitizes text, removing markdown and raw code syntax that causes TTS errors."""
+    if not text:
+        return ""
+    # Strip markdown tables
+    text = re.sub(r'\|[^\n]+\|\n\|[-:\s|]+\|\n(?:\|[^\n]+\|\n?)*', ' Table omitted. ', text)
+    text = re.sub(r'\|[^\n]+\|', ' ', text)
+    # Strip markdown code blocks
+    text = re.sub(r'```[\s\S]*?```', ' Code block omitted. ', text)
+    # Strip inline backticks
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Strip markdown image syntax
+    text = re.sub(r'!\[[^\]]*\]\([^\)]*\)', '', text)
+    # Strip markdown links, keeping label
+    text = re.sub(r'\[([^\]]+)\]\([^\)]*\)', r'\1', text)
+    # Clean URLs
+    text = re.sub(r'https?://\S+', ' link ', text)
+    # Strip GitHub alerts like > [!NOTE]
+    text = re.sub(r'>\s*\[![A-Z]+\]', '', text)
+    # Strip headers # and bullet points
+    text = re.sub(r'#{1,6}\s*', '', text)
+    text = re.sub(r'^[>*\-+]\s+', '', text, flags=re.MULTILINE)
+    # Clean math blocks and inline math
+    text = re.sub(r'\$\$[\s\S]*?\$\$', ' formula ', text)
+    text = re.sub(r'\$[^$\n]+\$', ' formula ', text)
+    # Strip bold / italic markers
+    text = re.sub(r'[*_]{1,3}([^*_]+)[*_]{1,3}', r'\1', text)
+    # Clean symbol artifacts
+    text = re.sub(r'[{}[\]<>]', ' ', text)
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    symbol_replacements = {
+        "{}": "empty curly braces",
+        "[]": "empty brackets",
+        "()": "empty parentheses",
+        "==": "equals",
+        "!=": "not equal",
+        "=>": "arrow",
+        "->": "arrow",
+        ">=": "greater than or equal",
+        "<=": "less than or equal",
+    }
+    if text in symbol_replacements:
+        return symbol_replacements[text]
+
+    if not re.search(r'[\w\u0900-\u097F]', text):
+        return ""
+
+    return text
+
+def get_selected_text_via_applescript():
+    """Attempts to copy selected text via Cmd+C, or falls back to current clipboard."""
+    script = '''
+    set savedClipboard to the clipboard
+    tell application "System Events"
+        keystroke "c" using command down
+    end tell
+    delay 0.15
+    set selectedText to the clipboard
+    return selectedText
+    '''
+    try:
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
+        text = res.stdout.strip()
+        if text:
+            return text
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["pbpaste"], capture_output=True, text=True, timeout=1)
+        return res.stdout.strip()
+    except Exception:
+        return ""
+
+def select_voice(text: str, default_voice: str, hindi_voice: str = "hi-IN-MadhurNeural") -> str:
+    """Devanagari text is read by the Hindi voice, everything else by the default."""
+    if any("\u0900" <= char <= "\u097f" for char in text):
+        return hindi_voice
+    return default_voice
+
+def say_args(text: str, rate: str):
+    """`say` command line for the same text; Edge's +N% becomes words per minute."""
+    args = ["/usr/bin/say"]
+    match = re.match(r'^([+-]?)(\d+)%$', (rate or "").strip())
+    if match:
+        percent = int(match.group(2)) * (-1 if match.group(1) == "-" else 1)
+        args += ["-r", str(max(90, min(420, round(175 * (1 + percent / 100)))))]
+    args.append(text)
+    return args
+
+def play_child(argv, temp_path=None):
+    """Run a player process to the end, so stop/pause/now keep working."""
+    proc = subprocess.Popen(argv)
+    with open(AFPLAY_PID_FILE, "w") as f:
+        f.write(str(proc.pid))
+
+    def handle_signal(sig, frame):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        stop_playback()
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+    proc.wait()
+
+async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
+                     engine: str = "auto"):
+    """Synthesize with Edge's Read Aloud voices, or fall back to macOS `say`."""
+    if engine == "say":
+        play_child(say_args(text, rate))
+        return
+
+    import edge_tts
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
+        temp_path = temp_audio.name
+
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+
+        try:
+            comm = edge_tts.Communicate(text, voice, rate=rate, volume=volume, pitch=pitch)
+            await comm.save(temp_path)
+        except Exception:
+            if engine == "auto":
+                play_child(say_args(text, rate))
+            return
+
+        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            if engine == "auto":
+                play_child(say_args(text, rate))
+            return
+
+        # A next/previous/replay arrived while this item was being synthesized,
+        # or the listener muted: skip starting it and let the worker loop carry on.
+        if os.path.exists(NAV_FILE) or is_muted():
+            return
+
+        play_child(["/usr/bin/afplay", temp_path], temp_path)
+    finally:
+        stop_playback()
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+def main():
+    ensure_state_dir()
+    args = sys.argv[1:]
+
+    if "--stop" in args:
+        cancel()
+        sys.exit(0)
+
+    if any(a in ("--pause", "--toggle-pause", "--pause-toggle") for a in args):
+        toggle_pause()
+        sys.exit(0)
+
+    if any(a in ("--mute", "--toggle-mute") for a in args):
+        print("Muted" if toggle_mute() else "Unmuted")
+        sys.exit(0)
+
+    if "--drain" in args:
+        drain()
+        sys.exit(0)
+
+    # Busy means audible now, or items still waiting, or a player about to start.
+    if "--status" in args:
+        sys.exit(0 if (is_playing() or worker_alive() or queue_size() > 0) else 1)
+
+    if "--now" in args:
+        print(json.dumps(now_state()))
+        sys.exit(0)
+
+    if "--next" in args:
+        navigate("next")
+        sys.exit(0)
+
+    if "--previous" in args or "--prev" in args:
+        navigate("prev")
+        sys.exit(0)
+
+    if "--replay" in args:
+        navigate("replay")
+        sys.exit(0)
+
+    if "--rate-up" in args:
+        print(adjust_rate(10))
+        sys.exit(0)
+
+    if "--rate-down" in args:
+        print(adjust_rate(-10))
+        sys.exit(0)
+
+    if "--toggle-auto" in args:
+        cfg = load_config()
+        current = cfg.get("AUTO_READ", "true").lower() in ("true", "1", "yes")
+        cfg["AUTO_READ"] = "false" if current else "true"
+        save_config(cfg)
+        status = "disabled" if current else "enabled"
+        print(f"Auto-read {status}")
+        ensure_overlay()
+        enqueue(f"Auto read {status}", cfg["VOICE"])
+        ensure_worker()
+        sys.exit(0)
+
+    # Default is a capped queue: a new answer, selection or spoken text
+    # waits behind what is speaking, and only the newest three may wait, so
+    # nothing goes stale behind a long answer. --force keeps the old interrupt
+    # behaviour for callers that must speak right now.
+    force = "--force" in args
+    text_args = [arg for arg in args if arg not in ("--force", "--queue", "--enqueue")]
+
+    cfg = load_config()
+
+    # Determine text to read
+    raw_text = ""
+    if text_args:
+        raw_text = " ".join(text_args).strip()
+    elif not sys.stdin.isatty():
+        raw_text = sys.stdin.read().strip()
+
+    if not raw_text:
+        raw_text = get_selected_text_via_applescript()
+
+    text = clean_text_for_speech(raw_text)
+    if not text:
+        sys.exit(0)
+
+    ensure_overlay()
+    voice = select_voice(text, cfg["VOICE"], cfg.get("LANGUAGE_HINDI_VOICE", "hi-IN-MadhurNeural"))
+
+    if force:
+        cancel()
+        try:
+            asyncio.run(speak_text(text, voice, cfg["RATE"], cfg["VOLUME"], cfg["PITCH"],
+                               cfg.get("ENGINE", "auto")))
+        except Exception:
+            sys.exit(0)
+        sys.exit(0)
+
+    enqueue(text, voice)
+    ensure_worker()
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
