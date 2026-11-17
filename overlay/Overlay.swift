@@ -92,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var playButton: NSButton!
     private var muteButton: NSButton!
     private var collapseButton: NSButton!
+    private var logoView: NSImageView!
     private var titleLabel: NSTextField!
     private var statusLabel: NSTextField!
     private var rateLabel: NSTextField!
@@ -202,12 +203,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rateLabel.toolTip = "Speech rate"
         rateLabel.frame = NSRect(x: 220, y: top + 4, width: 44, height: 18)
 
+        // The mark sits where the text line starts, so the bar carries the
+        // app's identity even though the app itself has no Dock icon.
+        let mark = Bundle.main.path(forResource: "MarkTemplate", ofType: "png")
+            .flatMap { NSImage(contentsOfFile: $0) } ?? NSApp.applicationIconImage
+        mark?.isTemplate = true
+        logoView = NSImageView(frame: NSRect(x: 14, y: 29, width: 15, height: 15))
+        logoView.image = mark
+        logoView.imageScaling = .scaleProportionallyUpOrDown
+        logoView.setAccessibilityLabel("Zero Eyes")
+
         titleLabel = NSTextField(labelWithString: "Ready")
         titleLabel.font = .systemFont(ofSize: 11.5)
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
-        titleLabel.frame = NSRect(x: 14, y: 31, width: 344, height: 15)
+        titleLabel.frame = NSRect(x: 35, y: 31, width: 323, height: 15)
 
         statusLabel = NSTextField(labelWithString: "Idle")
         statusLabel.font = .systemFont(ofSize: 10)
@@ -215,12 +226,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLabel.frame = NSRect(x: 14, y: 15, width: 344, height: 13)
 
         let views: [NSView] = [previous, playButton, stop, next, muteButton, slower, rateLabel, faster,
-                               collapseButton, close, titleLabel, statusLabel]
+                               collapseButton, close, logoView, titleLabel, statusLabel]
         for view in views {
             effect.addSubview(view)
         }
         expandedViews = [previous, stop, next, muteButton, slower, rateLabel, faster, close,
-                         titleLabel, statusLabel]
+                         logoView, titleLabel, statusLabel]
 
         if let saved = UserDefaults.standard.string(forKey: "overlayOrigin") {
             let parts = saved.split(separator: ",").compactMap { Double($0) }

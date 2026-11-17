@@ -27,6 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.zeroeyes.overlay</string>
   <key>CFBundleExecutable</key><string>ZeroEyesOverlay</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -66,3 +67,24 @@ fi
 
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "Built       $APP"
+
+# App icon, when a source image is in the repo. A top-level, no-Dock app still
+# shows this in Finder, Get Info, Login Items and notifications.
+ICON_SRC="$HERE/AppIcon.png"
+if [[ -f "$ICON_SRC" ]]; then
+  WORK="$(mktemp -d)"
+  ICONSET="$WORK/AppIcon.iconset"
+  mkdir -p "$ICONSET" "$APP/Contents/Resources"
+  for size in 16 32 128 256 512; do
+    sips -z "$size" "$size" "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1
+    sips -z $((size * 2)) $((size * 2)) "$ICON_SRC" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1
+  done
+  iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null \
+    && echo "Icon        AppIcon.icns"
+  if [[ -f "$HERE/MarkTemplate.png" ]]; then
+    cp "$HERE/MarkTemplate.png" "$APP/Contents/Resources/MarkTemplate.png"
+    echo "Mark        MarkTemplate.png"
+  fi
+  rm -rf "$WORK"
+  codesign --force --sign - "$APP" >/dev/null 2>&1 || true
+fi

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="overlay/AppIcon.png" width="128" alt="Zero Eyes">
+</p>
+
 # Zero Eyes
 
 Reads your AI coding agent's answers aloud on macOS, so you can look away from the screen and still follow the work.
