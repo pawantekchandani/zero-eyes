@@ -113,6 +113,7 @@ Details, state files and overrides: [docs/configuration.md](docs/configuration.m
 - Speech uses Microsoft Edge's own Read Aloud voice endpoint through the unofficial [`edge-tts`](https://github.com/rany2/edge-tts) package. No key, no account, no quota — and no guarantee: it is undocumented and Microsoft can change or block it at any time. `ENGINE="auto"` falls back to macOS `say` when that happens. Using that endpoint is your call and your responsibility.
 - Nothing leaves your machine except the text sent to that voice endpoint. No telemetry, no accounts.
 - State is per-user, in `~/Library/Application Support/Zero Eyes` (mode 700): the queue, the last 50 answers, and the current item. Delete that folder to clear history.
+- Not affiliated with ZeroEyes Inc. or any other company of a similar name — this is an independent listening tool for your own machine, not a security or surveillance product.
 - The overlay is ad-hoc signed and built locally; it is not notarized, and it is started by path rather than through LaunchServices for that reason.
 
 ## Uninstall
