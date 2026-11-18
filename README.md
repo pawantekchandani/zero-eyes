@@ -137,6 +137,18 @@ a rebuild macOS may ask again.
 - **Responsive overlay.** Play, Pause, Stop, Next and Previous show their new state as soon as they are clicked.
 - **Dock.** The overlay has a Dock icon and a Send to Dock button, so it can be hidden and brought back.
 
+## How it compares
+
+| | Zero Eyes | [Aloud](https://github.com/softcane/aloud) | [AgentsRoom](https://agentsroom.dev/features/read-aloud) Read Aloud |
+|---|---|---|---|
+| Price | Free, MIT | Free, MIT | Paid Pro tier, uses voice credits |
+| What is read | Every full answer, automatically | A short summary per answer; a hotkey reads the full answer | The last answer, a selection or a file, on click; optional AI summary |
+| Where speech is made | On your Mac (Apple voices) by default; Edge voices optional | On your Mac | On AgentsRoom servers; no offline voice |
+| Agents | Claude Code, OpenCode, any app through a macOS Service | Claude Code, Codex | Agents run inside the AgentsRoom app |
+| Controls | Floating bar: pause, stop, previous, next, speed, mute; shared queue | Hotkeys | Speaker button with progress, pause and stop |
+| Reply by voice | Yes, transcribed on your Mac | No | Separate dictation feature |
+| Platforms | macOS; Linux player | macOS | AgentsRoom desktop app |
+
 ## How the queue behaves
 
 One worker plays items in order, one at a time. Only the newest three may wait; a fourth arrival drops the oldest waiting item. Whatever is already speaking is never cut off. That keeps a fast agent from building a backlog you hear ten minutes later, while still letting two quick answers from different sessions both get heard.
