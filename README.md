@@ -58,6 +58,8 @@ That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and 
 
 Install one piece at a time with `scripts/install.sh --only player|overlay|launchagent|claude-code|opencode|services`.
 
+See what is installed and what is missing with `scripts/install.sh --check` (or `zero-eyes-setup --check`). It changes nothing, prints the fix for each missing item, and also runs at the end of a full install.
+
 Then assign shortcuts in **System Settings › Keyboard › Keyboard Shortcuts › Services**: `Zero Eyes Read` (suggested ⌃⌥Z) and `Zero Eyes Stop` (suggested ⌃⌥X).
 
 Test it:

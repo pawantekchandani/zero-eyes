@@ -4,6 +4,7 @@
 #   scripts/install.sh                 # everything it can
 #   scripts/install.sh --only player   # one part: player | overlay | launchagent
 #                                      #           claude-code | opencode | services
+#   scripts/install.sh --check         # report what is installed; changes nothing
 #
 # Idempotent: re-running replaces the files it owns and leaves everything else
 # alone. The one file it edits in place (~/.claude/settings.json) is backed up
@@ -21,8 +22,18 @@ PLUGIN_DIR="$HOME/.config/opencode/plugins"
 SERVICES="$HOME/Library/Services"
 OVERLAY_ZIP_URL="https://github.com/pawantekchandani/zero-eyes/releases/latest/download/ZeroEyesOverlay.zip"
 
+AGENT_LABEL="local.zeroeyes.overlay"
+
+# How the user re-runs setup, for the fix lines --check prints.
+case "$ROOT" in
+  */Cellar/zero-eyes/*|*/opt/zero-eyes/*) SETUP="zero-eyes-setup" ;;
+  *) SETUP="$ROOT/scripts/install.sh" ;;
+esac
+
 only=""
+check_only=0
 if [[ "${1:-}" == "--only" ]]; then only="${2:-}"; fi
+if [[ "${1:-}" == "--check" ]]; then check_only=1; fi
 want() { [[ -z "$only" || "$only" == "$1" ]]; }
 
 say() { printf '  %s\n' "$*"; }
@@ -95,9 +106,9 @@ install_launchagent() {
   mkdir -p "$(dirname "$AGENT")"
   sed "s|__APP_BINARY__|$APP/Contents/MacOS/ZeroEyesOverlay|" \
     "$ROOT/integrations/launchagent/local.zeroeyes.overlay.plist" > "$AGENT"
-  launchctl bootout "gui/$(id -u)/local.zeroeyes.overlay" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$AGENT" >/dev/null 2>&1 || true
-  launchctl kickstart -k "gui/$(id -u)/local.zeroeyes.overlay" >/dev/null 2>&1 || true
+  launchctl kickstart -k "gui/$(id -u)/$AGENT_LABEL" >/dev/null 2>&1 || true
   say "launchagent $AGENT"
 }
 
@@ -169,6 +180,124 @@ install_services() {
 TXT
 }
 
+# ---------------------------------------------------------------------------
+# --check: read-only report, one line per item. Exit 1 if anything is MISSING.
+
+missing_count=0
+row()     { printf '  %-7s %-12s %s\n' "$1" "$2" "$3"; }
+fix()     { printf '  %-7s %-12s fix: %s\n' "" "" "$1"; }
+ok()      { row OK "$1" "$2"; }
+warn()    { row WARN "$1" "$2"; [[ -n "${3:-}" ]] && fix "$3"; return 0; }
+missing() { row MISSING "$1" "$2"; fix "$3"; missing_count=$((missing_count + 1)); }
+
+# The speech engine the player will use. Kept in one place so it is easy to
+# change when the engine choice changes.
+check_engine() {
+  [[ -x "$PLAYER" ]] || return 0
+  local py
+  py="$(head -1 "$PLAYER")"
+  py="${py#\#!}"
+  [[ "$py" == "/usr/bin/env "* ]] && py="$(command -v "${py#/usr/bin/env }" 2>/dev/null || true)"
+  if [[ -n "$py" && -x "$py" ]] && "$py" -c 'import edge_tts' >/dev/null 2>&1; then
+    ok engine "edge-tts (python: $py)"
+  elif command -v say >/dev/null 2>&1; then
+    warn engine "macOS say — edge-tts not importable by ${py:-the player's python}" \
+      "${py:-python3} -m pip install edge-tts && $SETUP --only player"
+  else
+    missing engine "no edge-tts and no macOS say" "${py:-python3} -m pip install edge-tts && $SETUP --only player"
+  fi
+}
+
+# Shortcut for one Service, from the pasteboard server's prefs. The key looks
+# like "(null) - Zero Eyes Read - runWorkflowAsService".
+service_shortcut() {
+  /usr/bin/python3 - "$HOME/Library/Preferences/pbs.plist" "$1" <<'PY' 2>/dev/null
+import plistlib, sys
+try:
+    with open(sys.argv[1], "rb") as f:
+        status = plistlib.load(f).get("NSServicesStatus", {})
+except Exception:
+    raise SystemExit(2)
+entry = status.get(f"(null) - {sys.argv[2]} - runWorkflowAsService", {})
+key = entry.get("key_equivalent", "")
+if key:
+    print(key)
+else:
+    raise SystemExit(1)
+PY
+}
+
+run_check() {
+  local uid name key
+  uid="$(id -u)"
+  echo "Zero Eyes check"
+
+  if [[ -x "$PLAYER" ]]; then ok player "$PLAYER"
+  else missing player "$PLAYER" "$SETUP --only player"; fi
+
+  check_engine
+
+  if [[ -f "$CONFIG_DIR/config" ]]; then ok config "$CONFIG_DIR/config"
+  else missing config "$CONFIG_DIR/config" "$SETUP --only player"; fi
+
+  if [[ -d "$APP" ]]; then
+    ok overlay "$APP"
+    if codesign -v "$APP" >/dev/null 2>&1; then ok signature "valid"
+    else missing signature "codesign -v failed" "$SETUP --only overlay"; fi
+    if pgrep -f "$APP/Contents/MacOS/ZeroEyesOverlay" >/dev/null 2>&1; then ok running "overlay process found"
+    else warn running "overlay not running" "open \"$APP\""; fi
+  else
+    missing overlay "$APP" "$SETUP --only overlay"
+  fi
+
+  if [[ -f "$AGENT" ]]; then
+    ok launchagent "$AGENT"
+    if launchctl print "gui/$uid/$AGENT_LABEL" >/dev/null 2>&1; then ok loaded "gui/$uid/$AGENT_LABEL"
+    else warn loaded "not loaded in gui/$uid (starts at next login)" "launchctl bootstrap gui/$uid \"$AGENT\""; fi
+  else
+    missing launchagent "$AGENT" "$SETUP --only launchagent"
+  fi
+
+  if [[ -d "$HOME/.claude" ]]; then
+    if [[ -f "$HOOK" ]]; then ok hook "$HOOK"
+    else missing hook "$HOOK" "$SETUP --only claude-code"; fi
+    if /usr/bin/python3 - "$HOME/.claude/settings.json" "/usr/bin/python3 $HOOK" <<'PY' 2>/dev/null
+import json, sys
+with open(sys.argv[1]) as f:
+    stop = json.load(f).get("hooks", {}).get("Stop", [])
+found = any(e.get("command") == sys.argv[2] for g in stop for e in g.get("hooks", []))
+raise SystemExit(0 if found else 1)
+PY
+    then ok settings "Stop hook registered in ~/.claude/settings.json"
+    else missing settings "Stop hook not in ~/.claude/settings.json" "$SETUP --only claude-code"; fi
+  fi
+
+  if [[ -d "$HOME/.config/opencode" ]]; then
+    if [[ -L "$PLUGIN_DIR/zero-eyes" && -d "$PLUGIN_DIR/zero-eyes" ]]; then ok opencode "$PLUGIN_DIR/zero-eyes"
+    else missing opencode "$PLUGIN_DIR/zero-eyes" "$SETUP --only opencode"; fi
+  fi
+
+  for name in "Zero Eyes Read" "Zero Eyes Stop"; do
+    if [[ -d "$SERVICES/$name.workflow" ]]; then
+      ok service "$SERVICES/$name.workflow"
+      if key="$(service_shortcut "$name")"; then ok shortcut "$name: $key"
+      else warn shortcut "$name: no shortcut found" "System Settings › Keyboard › Keyboard Shortcuts › Services"; fi
+    else
+      missing service "$SERVICES/$name.workflow" "$SETUP --only services"
+    fi
+  done
+
+  echo
+  if (( missing_count == 0 )); then echo "Nothing missing."
+  else echo "$missing_count item(s) missing."; fi
+  (( missing_count == 0 ))
+}
+
+if (( check_only )); then
+  run_check
+  exit $?
+fi
+
 echo "Zero Eyes install"
 want player      && install_player
 want overlay     && install_overlay
@@ -179,3 +308,8 @@ want services    && install_services
 
 echo
 echo "Test it:  printf 'Zero Eyes is installed.' | $PLAYER"
+
+if [[ -z "$only" ]]; then
+  echo
+  run_check
+fi
