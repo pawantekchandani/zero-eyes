@@ -64,9 +64,12 @@ The overlay appears with the first thing spoken and can be dragged anywhere; it 
 | ⏯ | pause, resume; when idle, replay the last answer |
 | ⏹ | stop and clear the queue |
 | 🔇 | mute all output — the queue keeps draining, nothing piles up |
-| − / + | speech rate in 10% steps, from the next item |
+| − / + | speech rate in 10% steps; applies from the next part of the answer now playing |
 | ⌃ / ⌄ | collapse to a small pill |
+| Send to Dock | minimize the overlay to the Dock; click the Dock icon to bring it back |
 | ✕ | quit the overlay |
+
+Buttons redraw at once on click; the player catches up in the background.
 
 From the terminal:
 
@@ -76,6 +79,16 @@ zero-eyes --now                  # state as one JSON line
 zero-eyes --stop | --pause | --mute | --next | --previous | --replay
 zero-eyes --rate-up | --rate-down
 ```
+
+## Features
+
+- **Tables are read aloud.** Each row is spoken as `Header: value, Header: value.`, between "Table." and "End of table.", instead of being skipped.
+- **Fast start.** An answer is fetched in parts: a short first part, then parts of about 250 characters. Sound starts after the first part, and later parts are fetched while earlier ones play.
+- **Instant Previous and Replay.** Fetched parts are cached in the state folder (the newest 60 answers), so a replayed answer starts at once.
+- **Live speed change.** Each part is fetched at the rate set at that moment, so − / + changes the answer that is playing, not only the next one.
+- **No gap between answers.** While one answer plays, the first part of the next waiting answer is fetched, so the next answer starts about 0.05 s after the last one ends.
+- **Responsive overlay.** Play, Pause, Stop, Next and Previous show their new state as soon as they are clicked.
+- **Dock.** The overlay has a Dock icon and a Send to Dock button, so it can be hidden and brought back.
 
 ## How the queue behaves
 
