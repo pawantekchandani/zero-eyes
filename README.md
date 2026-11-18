@@ -28,7 +28,8 @@ Reads your AI coding agent's answers aloud on macOS, so you can look away from t
   `python3 -m pip install --user edge-tts`. The installer pins whichever `python3`
   can import it into the player's shebang, because hooks run with a minimal PATH
   where the wrong interpreter would be found.
-- Xcode command line tools, only for the floating overlay (`swiftc`)
+- Xcode command line tools are optional. With `swiftc` the installer builds the overlay;
+  without it, the installer downloads the prebuilt overlay from the latest GitHub release.
 
 Without `edge-tts` the player falls back to macOS `say`, so it still works — just
 with the system voice. Install it, re-run `scripts/install.sh`, and the Edge
@@ -36,13 +37,24 @@ voices take over. Set `ENGINE="edge" | "say" | "auto"` in the config to choose.
 
 ## Install
 
+With Homebrew:
+
+```sh
+brew install pawantekchandani/tap/zero-eyes
+zero-eyes-setup
+```
+
+Run `zero-eyes-setup` again after each `brew upgrade zero-eyes`.
+
+Or from a clone:
+
 ```sh
 git clone https://github.com/pawantekchandani/zero-eyes.git
 cd zero-eyes
 scripts/install.sh
 ```
 
-That installs the player to `~/.local/bin/zero-eyes`, builds and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, and copies the two macOS Services.
+That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, and copies the two macOS Services.
 
 Install one piece at a time with `scripts/install.sh --only player|overlay|launchagent|claude-code|opencode|services`.
 
