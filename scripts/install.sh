@@ -19,6 +19,7 @@ AGENT="$HOME/Library/LaunchAgents/local.zeroeyes.overlay.plist"
 HOOK="$HOME/.claude/hooks/zero-eyes-stop.py"
 PLUGIN_DIR="$HOME/.config/opencode/plugins"
 SERVICES="$HOME/Library/Services"
+OVERLAY_ZIP_URL="https://github.com/pawantekchandani/zero-eyes/releases/latest/download/ZeroEyesOverlay.zip"
 
 only=""
 if [[ "${1:-}" == "--only" ]]; then only="${2:-}"; fi
@@ -68,12 +69,22 @@ CFG
 }
 
 install_overlay() {
-  if ! command -v swiftc >/dev/null 2>&1; then
-    say "overlay     skipped — Xcode command line tools not found (swiftc)"
+  if command -v swiftc >/dev/null 2>&1; then
+    "$ROOT/overlay/build.sh" >/dev/null
+    say "overlay     $APP (built)"
     return
   fi
-  "$ROOT/overlay/build.sh" >/dev/null
-  say "overlay     $APP"
+  # No Xcode tools: use the prebuilt, ad-hoc signed app from the latest release.
+  local zip
+  zip="$(mktemp -d)/ZeroEyesOverlay.zip"
+  if curl -fsSL -o "$zip" "$OVERLAY_ZIP_URL"; then
+    mkdir -p "$(dirname "$APP")"
+    rm -rf "$APP"
+    ditto -x -k "$zip" "$(dirname "$APP")"
+    say "overlay     $APP (prebuilt release)"
+  else
+    say "overlay     skipped — no swiftc and the prebuilt download failed"
+  fi
 }
 
 install_launchagent() {
