@@ -68,7 +68,8 @@ PY
 fi
 
 for workflow in "$HOME/Library/Services/Zero Eyes Read.workflow" \
-                "$HOME/Library/Services/Zero Eyes Stop.workflow"; do
+                "$HOME/Library/Services/Zero Eyes Stop.workflow" \
+                "$HOME/Library/Services/Zero Eyes Reply.workflow"; do
   [[ -d "$workflow" ]] && rm -rf "$workflow" && say "removed ${workflow:t}"
 done
 

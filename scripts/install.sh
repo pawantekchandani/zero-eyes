@@ -187,8 +187,12 @@ install_services() {
   done
   cat <<'TXT'
   services    assign keys in System Settings › Keyboard › Keyboard Shortcuts › Services
-              (suggested: Zero Eyes Read ⌃⌥Z, Zero Eyes Stop ⌃⌥X)
+              (suggested: Zero Eyes Read ⌃⌥Z, Zero Eyes Stop ⌃⌥X, Zero Eyes Reply ⌃⌥R)
 TXT
+  if ! PATH="$PATH:/opt/homebrew/bin:/usr/local/bin" command -v whisper-cli >/dev/null 2>&1; then
+    say "reply       optional: brew install whisper-cpp (needed for Zero Eyes Reply)"
+  fi
+  say "reply       allow Microphone and Accessibility for Zero Eyes Overlay when asked"
 }
 
 # ---------------------------------------------------------------------------
@@ -301,7 +305,7 @@ PY
     else missing opencode "$PLUGIN_DIR/zero-eyes" "$SETUP --only opencode"; fi
   fi
 
-  for name in "Zero Eyes Read" "Zero Eyes Stop"; do
+  for name in "Zero Eyes Read" "Zero Eyes Stop" "Zero Eyes Reply"; do
     if [[ -d "$SERVICES/$name.workflow" ]]; then
       ok service "$SERVICES/$name.workflow"
       if key="$(service_shortcut "$name")"; then ok shortcut "$name: $key"

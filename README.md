@@ -19,6 +19,7 @@ Reads your AI coding agent's answers aloud on macOS, so you can look away from t
 - **A floating bar you can actually use.** Pause, stop, step through recent answers, change speed, or mute everything while the queue keeps draining silently.
 - **Knows which app is talking.** The first line names the app the speech came from: `Claude`, `T3 Code`, `OpenCode`, `Google Chrome`, and so on.
 - **Select text and press a key.** A macOS Service reads the selection in any app.
+- **Reply by voice.** Press the reply shortcut, speak, and your words are transcribed on this Mac and pasted into the app in front.
 
 ## Requirements
 
@@ -33,6 +34,9 @@ Reads your AI coding agent's answers aloud on macOS, so you can look away from t
   with a minimal PATH where the wrong interpreter would be found.
 - Xcode command line tools are optional. With `swiftc` the installer builds the overlay;
   without it, the installer downloads the prebuilt overlay from the latest GitHub release.
+- [`whisper-cpp`](https://github.com/ggml-org/whisper.cpp) is optional, for voice replies:
+  `brew install whisper-cpp`. The speech model (`ggml-base.en`, about 148 MB) is downloaded
+  on first use.
 
 By default the Mac's own voices speak, offline. Set `ENGINE="apple" | "edge" | "say"`
 in the config to choose.
@@ -56,13 +60,13 @@ cd zero-eyes
 scripts/install.sh
 ```
 
-That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, and copies the two macOS Services.
+That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, and copies the three macOS Services.
 
 Install one piece at a time with `scripts/install.sh --only player|overlay|launchagent|claude-code|opencode|services`.
 
 See what is installed and what is missing with `scripts/install.sh --check` (or `zero-eyes-setup --check`). It changes nothing, prints the fix for each missing item, and also runs at the end of a full install.
 
-Then assign shortcuts in **System Settings › Keyboard › Keyboard Shortcuts › Services**: `Zero Eyes Read` (suggested ⌃⌥Z) and `Zero Eyes Stop` (suggested ⌃⌥X).
+Then assign shortcuts in **System Settings › Keyboard › Keyboard Shortcuts › Services**: `Zero Eyes Read` (suggested ⌃⌥Z), `Zero Eyes Stop` (suggested ⌃⌥X) and `Zero Eyes Reply` (suggested ⌃⌥R).
 
 Test it:
 
@@ -81,6 +85,7 @@ The overlay appears with the first thing spoken and can be dragged anywhere; it 
 | ⏹ | stop and clear the queue |
 | 🔇 | mute all output — the queue keeps draining, nothing piles up |
 | − / + | speech rate in 10% steps; applies from the next part of the answer now playing |
+| 🎤 | reply by voice: press to start, press again to send |
 | ⌃ / ⌄ | collapse to a small pill |
 | Send to Dock | minimize the overlay to the Dock; click the Dock icon to bring it back |
 | ✕ | quit the overlay |
@@ -94,7 +99,20 @@ printf '%s' "text" | zero-eyes   # queue it
 zero-eyes --now                  # state as one JSON line
 zero-eyes --stop | --pause | --mute | --next | --previous | --replay
 zero-eyes --rate-up | --rate-down
+zero-eyes --reply                # start a voice reply; run again to send
 ```
+
+## Reply by voice
+
+1. Press `Zero Eyes Reply` (or the 🎤 button). Speech stops and a sound plays.
+2. Speak. Press again, or stop talking for 2 seconds, to finish.
+3. `whisper-cli` transcribes the recording on this Mac. The audio file is deleted.
+4. The text is pasted into the app in front. With `REPLY_SUBMIT="true"`, Return is pressed too.
+
+The overlay asks for two permissions for **Zero Eyes Overlay**: Microphone (to record)
+and Accessibility (to paste). Without Accessibility the text stays on the clipboard and
+the overlay says "Reply copied. Press Command V." The overlay is ad-hoc signed, so after
+a rebuild macOS may ask again.
 
 ## Features
 
@@ -135,6 +153,10 @@ Per-session rules (speak only certain roles, mute a session) are configuration, 
 | `PITCH` | `+0Hz` | Edge pitch |
 | `MUTED` | `false` | muted at start |
 | `AUTO_READ` | `true` | whether OpenCode auto-read starts on |
+| `REPLY_MODEL` | empty | whisper model file; empty = `ggml-base.en`, downloaded on first use |
+| `REPLY_LANGUAGE` | `en` | language passed to whisper |
+| `REPLY_SUBMIT` | `false` | press Return after pasting a reply |
+| `REPLY_SILENCE` | `2` | seconds of silence that end a reply; `0` = only the shortcut ends it |
 
 Details, state files and overrides: [docs/configuration.md](docs/configuration.md).
 
@@ -142,7 +164,7 @@ Details, state files and overrides: [docs/configuration.md](docs/configuration.m
 
 - By default speech uses the Mac's own voices and stays on your machine.
 - `ENGINE="edge"` uses Microsoft Edge's own Read Aloud voice endpoint through the unofficial [`edge-tts`](https://github.com/rany2/edge-tts) package. No key, no account, no quota — and no guarantee: it is undocumented and Microsoft can change or block it at any time. Using that endpoint is your call and your responsibility.
-- Nothing leaves your machine except, with `ENGINE="edge"`, the text sent to that voice endpoint. No telemetry, no accounts.
+- Nothing leaves your machine except, with `ENGINE="edge"`, the text sent to that voice endpoint. Voice replies are transcribed locally. No telemetry, no accounts.
 - State is per-user, in `~/Library/Application Support/Zero Eyes` (mode 700): the queue, the last 50 answers, and the current item. Delete that folder to clear history.
 - Not affiliated with ZeroEyes Inc. or any other company of a similar name — this is an independent listening tool for your own machine, not a security or surveillance product.
 - The overlay is ad-hoc signed and built locally; it is not notarized, and it is started by path rather than through LaunchServices for that reason.
