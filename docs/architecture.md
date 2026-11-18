@@ -4,8 +4,8 @@ Four programs, one owner of the audio.
 
 ```
   Claude Code Stop hook ─┐
-  OpenCode plugin    ────┼──>  zero-eyes  ──>  edge-tts (mp3)  ──>  afplay
-  macOS Service      ────┤     (enqueue)                └── or ──>  say
+  OpenCode plugin    ────┼──>  zero-eyes  ──>  say -o (m4a) or edge-tts (mp3)  ──>  afplay
+  macOS Service      ────┤     (enqueue)
   anything (pipe)    ────┘          │
                                     │ writes queue/, now.json, history.json
                                     ▼
@@ -42,10 +42,11 @@ and loops:
    synthesize and play it;
 3. exit when the queue is empty.
 
-Synthesis writes a temporary MP3 (`edge_tts.Communicate(...).save()`), then plays
-it with `afplay`. If `edge-tts` fails or is missing and the engine is `auto`, the
-same text goes to `say`, slowed or quickened to match the configured rate. Stop
-and pause signal the playing child, so they are immediate even mid-sentence.
+Synthesis writes each part to a cached file — `say -v <voice> -r <wpm> -o` (AAC)
+for the default Apple engine, `edge_tts.Communicate(...).save()` (MP3) with
+`ENGINE="edge"` — then plays it with `afplay`. If the Apple engine cannot make the
+first part, the same text goes straight to `say`. Stop and pause signal the
+playing child, so they are immediate even mid-sentence.
 
 Because there is one worker, several harnesses can enqueue at the same time and
 still be played one after another.
@@ -67,8 +68,8 @@ re-started by the player whenever anything is spoken.
 
 ## Failure behaviour
 
-- `edge-tts` missing, offline, or the endpoint changed → `say`, or silence with
-  `ENGINE="edge"`.
+- `edge-tts` missing, offline, or the endpoint changed → silence with
+  `ENGINE="edge"`; the default Apple engine needs neither.
 - Overlay missing → speech still works; the player skips the launch.
 - Worker killed mid-item → the item is already in history; `--replay` reads it again.
 - Stale state after a crash → pid files are checked with `kill -0` and discarded

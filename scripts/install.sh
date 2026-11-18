@@ -42,9 +42,9 @@ install_player() {
   mkdir -p "$BIN_DIR"
   install -m 0755 "$ROOT/bin/zero-eyes" "$PLAYER"
 
-  # Hooks run with a minimal PATH, where `python3` may be the system 3.9 that
-  # cannot see a pip-installed edge-tts. Pin the interpreter that has it, so the
-  # Edge voices are used instead of silently falling back to `say`.
+  # Edge voices are optional (ENGINE="edge"). Hooks run with a minimal PATH,
+  # where `python3` may be the system 3.9 that cannot see a pip-installed
+  # edge-tts, so pin the interpreter that has it when there is one.
   local py="" candidate
   for candidate in "$HOME/.local/bin/python3" "$(command -v python3 2>/dev/null)" \
                    /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
@@ -58,7 +58,7 @@ install_player() {
     /usr/bin/sed -i '' "1s|.*|#!$py|" "$PLAYER"
     say "player      $PLAYER (python: $py)"
   else
-    say "player      $PLAYER (no python with edge-tts found — using macOS say)"
+    say "player      $PLAYER (no python with edge-tts: Edge voices unavailable)"
   fi
 
   mkdir -p "$CONFIG_DIR"
@@ -71,11 +71,22 @@ VOLUME="+0%"
 PITCH="+0Hz"
 AUTO_READ="true"
 MUTED="false"
-ENGINE="auto"
+ENGINE="apple"
+APPLE_VOICE=""
 CFG
     say "config      $CONFIG_DIR/config (new)"
   else
     say "config      $CONFIG_DIR/config (kept)"
+  fi
+
+  # The Apple engine picks the best installed English voice on its own; the
+  # built-in compact voices sound flat, so point at the better ones.
+  local voices
+  voices="$(/usr/bin/osascript -l JavaScript \
+    -e 'ObjC.import("AppKit"); ObjC.unwrap($.NSSpeechSynthesizer.availableVoices).map(ObjC.unwrap).join("\n")' \
+    2>/dev/null || true)"
+  if ! grep -qE '^com\.apple\.voice\.(premium|enhanced)\.en-' <<<"$voices"; then
+    say "voice       no Premium or Enhanced English voice installed; add one in System Settings › Accessibility › Spoken Content › System Voice › Manage Voices"
   fi
 }
 
@@ -194,17 +205,30 @@ missing() { row MISSING "$1" "$2"; fix "$3"; missing_count=$((missing_count + 1)
 # change when the engine choice changes.
 check_engine() {
   [[ -x "$PLAYER" ]] || return 0
-  local py
-  py="$(head -1 "$PLAYER")"
-  py="${py#\#!}"
-  [[ "$py" == "/usr/bin/env "* ]] && py="$(command -v "${py#/usr/bin/env }" 2>/dev/null || true)"
-  if [[ -n "$py" && -x "$py" ]] && "$py" -c 'import edge_tts' >/dev/null 2>&1; then
-    ok engine "edge-tts (python: $py)"
-  elif command -v say >/dev/null 2>&1; then
-    warn engine "macOS say — edge-tts not importable by ${py:-the player's python}" \
-      "${py:-python3} -m pip install edge-tts && $SETUP --only player"
+  local engine="" py voices
+  [[ -f "$CONFIG_DIR/config" ]] && engine="$(sed -n 's/^ENGINE="\{0,1\}\([a-z]*\)"\{0,1\}$/\1/p' "$CONFIG_DIR/config" | tail -1)"
+  if [[ "$engine" == "edge" ]]; then
+    py="$(head -1 "$PLAYER")"
+    py="${py#\#!}"
+    [[ "$py" == "/usr/bin/env "* ]] && py="$(command -v "${py#/usr/bin/env }" 2>/dev/null || true)"
+    if [[ -n "$py" && -x "$py" ]] && "$py" -c 'import edge_tts' >/dev/null 2>&1; then
+      ok engine "edge (python: $py)"
+    else
+      missing engine "ENGINE=\"edge\" but edge-tts is not importable by ${py:-the player's python}" \
+        "${py:-python3} -m pip install edge-tts && $SETUP --only player"
+    fi
+  elif [[ "$engine" == "say" ]]; then
+    ok engine "say"
   else
-    missing engine "no edge-tts and no macOS say" "${py:-python3} -m pip install edge-tts && $SETUP --only player"
+    voices="$(/usr/bin/osascript -l JavaScript \
+      -e 'ObjC.import("AppKit"); ObjC.unwrap($.NSSpeechSynthesizer.availableVoices).map(ObjC.unwrap).join("\n")' \
+      2>/dev/null || true)"
+    if grep -qE '^com\.apple\.voice\.(premium|enhanced)\.en-' <<<"$voices"; then
+      ok engine "apple (Premium or Enhanced English voice installed)"
+    else
+      warn engine "apple, with the basic system voice only" \
+        "System Settings › Accessibility › Spoken Content › System Voice › Manage Voices"
+    fi
   fi
 }
 
