@@ -24,16 +24,18 @@ Reads your AI coding agent's answers aloud on macOS, so you can look away from t
 
 - macOS 13 or later
 - `python3`
-- [`edge-tts`](https://github.com/rany2/edge-tts) for Microsoft Edge's Read Aloud voices:
-  `python3 -m pip install --user edge-tts`. The installer pins whichever `python3`
-  can import it into the player's shebang, because hooks run with a minimal PATH
-  where the wrong interpreter would be found.
+- Optional: a Premium or Enhanced English voice, which sounds much better than the
+  built-in compact ones. Add one in System Settings › Accessibility › Spoken Content ›
+  System Voice › Manage Voices; the player picks the best installed one on its own.
+- Optional: [`edge-tts`](https://github.com/rany2/edge-tts) for Microsoft Edge's Read
+  Aloud voices (`ENGINE="edge"`): `python3 -m pip install --user edge-tts`. The installer
+  pins whichever `python3` can import it into the player's shebang, because hooks run
+  with a minimal PATH where the wrong interpreter would be found.
 - Xcode command line tools are optional. With `swiftc` the installer builds the overlay;
   without it, the installer downloads the prebuilt overlay from the latest GitHub release.
 
-Without `edge-tts` the player falls back to macOS `say`, so it still works — just
-with the system voice. Install it, re-run `scripts/install.sh`, and the Edge
-voices take over. Set `ENGINE="edge" | "say" | "auto"` in the config to choose.
+By default the Mac's own voices speak, offline. Set `ENGINE="apple" | "edge" | "say"`
+in the config to choose.
 
 ## Install
 
@@ -125,11 +127,12 @@ Per-session rules (speak only certain roles, mute a session) are configuration, 
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `ENGINE` | `apple` | `apple` = the Mac's own voices, offline (`auto` means the same); `edge` = Edge voices only; `say` = `say` speaks directly |
+| `APPLE_VOICE` | empty | Apple voice name or identifier; empty = the best installed English voice (Premium, then Enhanced, then the system voice) |
 | `VOICE` | `en-IN-PrabhatNeural` | Edge voice; `edge-tts --list-voices` shows all |
-| `RATE` | `+0%` | Edge speaking rate |
+| `RATE` | `+0%` | speaking rate, for every engine |
 | `VOLUME` | `+0%` | Edge volume |
 | `PITCH` | `+0Hz` | Edge pitch |
-| `ENGINE` | `auto` | `auto` = Edge then `say`, `edge` = Edge only, `say` = `say` only |
 | `MUTED` | `false` | muted at start |
 | `AUTO_READ` | `true` | whether OpenCode auto-read starts on |
 
@@ -137,8 +140,9 @@ Details, state files and overrides: [docs/configuration.md](docs/configuration.m
 
 ## Notes
 
-- Speech uses Microsoft Edge's own Read Aloud voice endpoint through the unofficial [`edge-tts`](https://github.com/rany2/edge-tts) package. No key, no account, no quota — and no guarantee: it is undocumented and Microsoft can change or block it at any time. `ENGINE="auto"` falls back to macOS `say` when that happens. Using that endpoint is your call and your responsibility.
-- Nothing leaves your machine except the text sent to that voice endpoint. No telemetry, no accounts.
+- By default speech uses the Mac's own voices and stays on your machine.
+- `ENGINE="edge"` uses Microsoft Edge's own Read Aloud voice endpoint through the unofficial [`edge-tts`](https://github.com/rany2/edge-tts) package. No key, no account, no quota — and no guarantee: it is undocumented and Microsoft can change or block it at any time. Using that endpoint is your call and your responsibility.
+- Nothing leaves your machine except, with `ENGINE="edge"`, the text sent to that voice endpoint. No telemetry, no accounts.
 - State is per-user, in `~/Library/Application Support/Zero Eyes` (mode 700): the queue, the last 50 answers, and the current item. Delete that folder to clear history.
 - Not affiliated with ZeroEyes Inc. or any other company of a similar name — this is an independent listening tool for your own machine, not a security or surveillance product.
 - The overlay is ad-hoc signed and built locally; it is not notarized, and it is started by path rather than through LaunchServices for that reason.

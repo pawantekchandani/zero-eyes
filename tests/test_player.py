@@ -59,6 +59,97 @@ class SplitChunksTests(unittest.TestCase):
         self.assertEqual(" ".join(chunks), " ".join([sentence] * 20))
 
 
+class EngineTests(unittest.TestCase):
+    def test_named_engines_are_kept(self):
+        for engine in ("apple", "edge", "say"):
+            self.assertEqual(ze.resolve_engine(engine), engine)
+        self.assertEqual(ze.resolve_engine(" Edge "), "edge")
+
+    def test_auto_empty_and_unknown_mean_apple(self):
+        for value in ("auto", "", None, "bogus"):
+            self.assertEqual(ze.resolve_engine(value), "apple")
+
+    def test_default_engine_is_apple(self):
+        with mock.patch.object(ze, "CONFIG_FILE", os.path.join(_STATE, "no-config")), \
+             mock.patch.dict(os.environ, {"ZERO_EYES_ENGINE": ""}):
+            cfg = ze.load_config()
+        self.assertEqual(cfg["ENGINE"], "apple")
+        self.assertEqual(cfg["APPLE_VOICE"], "")
+
+
+class RateTests(unittest.TestCase):
+    def test_rate_to_wpm(self):
+        self.assertEqual(ze.rate_to_wpm("+0%"), 175)
+        self.assertEqual(ze.rate_to_wpm("+20%"), 210)
+        self.assertEqual(ze.rate_to_wpm("-50%"), 90)   # clamped
+        self.assertEqual(ze.rate_to_wpm("+200%"), 420)  # clamped
+        self.assertIsNone(ze.rate_to_wpm("fast"))
+
+    def test_apple_synth_args(self):
+        self.assertEqual(
+            ze.apple_synth_args("com.apple.voice.compact.en-IN.Rishi", "+20%", "/tmp/x"),
+            ["/usr/bin/say", "-v", "com.apple.voice.compact.en-IN.Rishi", "-r", "210",
+             "--file-format=m4af", "--data-format=aac", "-o", "/tmp/x"])
+        self.assertEqual(ze.apple_synth_args("", "odd", "/tmp/x"),
+                         ["/usr/bin/say", "--file-format=m4af", "--data-format=aac", "-o", "/tmp/x"])
+
+    def test_say_args_unchanged(self):
+        self.assertEqual(ze.say_args("hi", "+0%"), ["/usr/bin/say", "-r", "175", "hi"])
+
+
+# Shape of the osascript voice list: identifier, a tab, the locale.
+SAMPLE_VOICES = "\n".join([
+    "com.apple.speech.synthesis.voice.Albert\ten_US",
+    "com.apple.voice.compact.en-IN.Rishi\ten_IN",
+    "com.apple.voice.Aman.premium\ten_IN",          # Siri voice: not usable by say
+    "com.apple.voice.enhanced.en-GB.Daniel\ten_GB",
+    "com.apple.voice.premium.en-US.Zoe\ten_US",
+    "com.apple.voice.premium.de-DE.Anna\tde_DE",
+    "com.apple.voice.compact.hi-IN.Lekha\thi_IN",
+    "",
+])
+
+
+class AppleVoiceTests(unittest.TestCase):
+    def setUp(self):
+        self.voices = ze.parse_apple_voices(SAMPLE_VOICES)
+
+    def test_parse(self):
+        self.assertEqual(len(self.voices), 7)
+        self.assertEqual(self.voices[1], ("com.apple.voice.compact.en-IN.Rishi", "en-IN"))
+
+    def test_quality(self):
+        self.assertEqual(ze.apple_voice_quality("com.apple.voice.premium.en-US.Zoe"), 3)
+        self.assertEqual(ze.apple_voice_quality("com.apple.voice.enhanced.en-GB.Daniel"), 2)
+        self.assertEqual(ze.apple_voice_quality("com.apple.voice.Aman.premium"), 1)
+        self.assertEqual(ze.apple_voice_quality("com.apple.voice.compact.en-IN.Rishi"), 1)
+
+    def test_premium_english_wins(self):
+        self.assertEqual(ze.apple_voice_for("Hello.", "", self.voices),
+                         "com.apple.voice.premium.en-US.Zoe")
+
+    def test_enhanced_when_no_premium(self):
+        voices = [v for v in self.voices if ".premium." not in v[0]]
+        self.assertEqual(ze.apple_voice_for("Hello.", "", voices),
+                         "com.apple.voice.enhanced.en-GB.Daniel")
+
+    def test_compact_only_means_system_voice(self):
+        voices = [v for v in self.voices if "compact" in v[0] or "Aman" in v[0]]
+        self.assertEqual(ze.apple_voice_for("Hello.", "", voices), "")
+
+    def test_configured_voice_wins_for_english(self):
+        self.assertEqual(ze.apple_voice_for("Hello.", "Samantha", self.voices), "Samantha")
+
+    def test_devanagari_uses_hindi_voice(self):
+        self.assertEqual(ze.apple_voice_for("नमस्ते दुनिया", "Samantha", self.voices),
+                         "com.apple.voice.compact.hi-IN.Lekha")
+
+    def test_devanagari_without_hindi_voice_uses_default(self):
+        voices = [v for v in self.voices if not v[1].startswith("hi")]
+        self.assertEqual(ze.apple_voice_for("नमस्ते", "", voices),
+                         "com.apple.voice.premium.en-US.Zoe")
+
+
 class QueueCapTests(unittest.TestCase):
     def setUp(self):
         ze.clear_queue()

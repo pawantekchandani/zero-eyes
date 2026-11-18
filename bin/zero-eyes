@@ -3,9 +3,9 @@
 
 The shared player behind every Zero Eyes surface: the auto-read hooks, the
 macOS Services read (select text, press the shortcut), and the floating
-overlay. Speech is synthesized by Microsoft Edge's Read Aloud voice service
-through the `edge-tts` package, falling back to macOS `say` when that is
-unavailable, and played by `afplay`.
+overlay. Speech is synthesized by the Mac's own voices (`say`, offline) or,
+when chosen, by Microsoft Edge's Read Aloud voice service through the
+`edge-tts` package, and played by `afplay`.
 
     printf '%s' "text" | zero-eyes      # queue it, newest 3 wait
     zero-eyes --now                    # one JSON line of state
@@ -57,9 +57,13 @@ def load_config():
         "PITCH": "+0Hz",
         "AUTO_READ": "true",
         "MUTED": "false",
-        # auto: Edge TTS, then macOS say; edge: Edge TTS only; say: say only.
-        "ENGINE": "auto",
+        # apple: the Mac's own voices (auto is the same); edge: Edge TTS only;
+        # say: say speaks directly, without files.
+        "ENGINE": "apple",
         "LANGUAGE_HINDI_VOICE": "hi-IN-MadhurNeural",
+        # Empty: the best installed English voice (Premium, then Enhanced,
+        # then the system voice). Any `say -v` name or voice identifier.
+        "APPLE_VOICE": "",
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -88,7 +92,8 @@ def save_config(cfg):
         f'PITCH="{cfg.get("PITCH", "+0Hz")}"',
         f'AUTO_READ="{cfg.get("AUTO_READ", "true")}"',
         f'MUTED="{cfg.get("MUTED", "false")}"',
-        f'ENGINE="{cfg.get("ENGINE", "auto")}"'
+        f'ENGINE="{cfg.get("ENGINE", "apple")}"',
+        f'APPLE_VOICE="{cfg.get("APPLE_VOICE", "")}"',
     ]
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
@@ -592,7 +597,8 @@ def play_item(item, cfg):
             cfg["RATE"],
             cfg["VOLUME"],
             cfg["PITCH"],
-            cfg.get("ENGINE", "auto"),
+            cfg.get("ENGINE", "apple"),
+            cfg.get("APPLE_VOICE", ""),
         ))
     except Exception:
         pass
@@ -742,21 +748,123 @@ def get_selected_text_via_applescript():
     except Exception:
         return ""
 
+def has_devanagari(text: str) -> bool:
+    return any("\u0900" <= char <= "\u097f" for char in text)
+
 def select_voice(text: str, default_voice: str, hindi_voice: str = "hi-IN-MadhurNeural") -> str:
     """Devanagari text is read by the Hindi voice, everything else by the default."""
-    if any("\u0900" <= char <= "\u097f" for char in text):
+    if has_devanagari(text):
         return hindi_voice
     return default_voice
 
-def say_args(text: str, rate: str):
+ENGINES = ("apple", "edge", "say")
+
+def resolve_engine(value: str) -> str:
+    """The engine to use for a configured ENGINE value.
+
+    `auto` (the old default) and anything unknown mean `apple`, so an old
+    config keeps working without the unofficial Edge endpoint. Edge is used
+    only when it is asked for by name.
+    """
+    value = (value or "").strip().lower()
+    return value if value in ENGINES else "apple"
+
+def rate_to_wpm(rate: str):
+    """Edge's +N% as `say` words per minute (175 is 0%), or None if unreadable."""
+    match = re.match(r'^([+-]?)(\d+)%$', (rate or "").strip())
+    if not match:
+        return None
+    percent = int(match.group(2)) * (-1 if match.group(1) == "-" else 1)
+    return max(90, min(420, round(175 * (1 + percent / 100))))
+
+def say_args(text: str, rate: str, voice: str = ""):
     """`say` command line for the same text; Edge's +N% becomes words per minute."""
     args = ["/usr/bin/say"]
-    match = re.match(r'^([+-]?)(\d+)%$', (rate or "").strip())
-    if match:
-        percent = int(match.group(2)) * (-1 if match.group(1) == "-" else 1)
-        args += ["-r", str(max(90, min(420, round(175 * (1 + percent / 100)))))]
+    if voice:
+        args += ["-v", voice]
+    wpm = rate_to_wpm(rate)
+    if wpm:
+        args += ["-r", str(wpm)]
     args.append(text)
     return args
+
+def apple_synth_args(voice: str, rate: str, out_path: str):
+    """`say` command line that writes one part to an AAC file; the text goes
+    on stdin, so text that starts with "-" is never read as an option."""
+    args = ["/usr/bin/say"]
+    if voice:
+        args += ["-v", voice]
+    wpm = rate_to_wpm(rate)
+    if wpm:
+        args += ["-r", str(wpm)]
+    return args + ["--file-format=m4af", "--data-format=aac", "-o", out_path]
+
+# The voices `say` can use, one "identifier<TAB>locale" line each. `say -v '?'`
+# shows neither the identifier nor the quality, so ask the speech framework.
+_APPLE_VOICES_JS = (
+    'ObjC.import("AppKit");'
+    'var v = $.NSSpeechSynthesizer.availableVoices, out = [];'
+    'for (var i = 0; i < v.count; i++) {'
+    '  var id = v.objectAtIndex(i);'
+    '  var loc = $.NSSpeechSynthesizer.attributesForVoice(id).objectForKey("VoiceLocaleIdentifier");'
+    '  out.push(ObjC.unwrap(id) + "\\t" + ObjC.unwrap(loc));'
+    '}'
+    'out.join("\\n")'
+)
+_apple_voices = None
+
+def parse_apple_voices(output: str):
+    """[(identifier, locale)] from the voice list, locale as `en-IN`."""
+    voices = []
+    for line in output.splitlines():
+        ident, _, locale = line.strip().partition("\t")
+        if ident:
+            voices.append((ident, locale.strip().replace("_", "-")))
+    return voices
+
+def apple_voice_quality(identifier: str) -> int:
+    """3 Premium, 2 Enhanced, 1 anything else. Only the downloadable
+    `com.apple.voice.premium.*` / `.enhanced.*` voices count: Siri voices
+    show up in the list too, but `say` cannot use them."""
+    match = re.match(r'^com\.apple\.voice\.(premium|enhanced)\.', identifier)
+    if not match:
+        return 1
+    return 3 if match.group(1) == "premium" else 2
+
+def best_apple_voice(voices, language: str, min_quality: int = 1) -> str:
+    """The best voice for a language (`en`, `hi`) of at least min_quality,
+    first listed on a tie; "" when there is none."""
+    best, best_quality = "", min_quality - 1
+    for ident, locale in voices:
+        if locale.split("-")[0].lower() != language:
+            continue
+        quality = apple_voice_quality(ident)
+        if quality > best_quality:
+            best, best_quality = ident, quality
+    return best
+
+def installed_apple_voices():
+    global _apple_voices
+    if _apple_voices is None:
+        try:
+            out = subprocess.run(
+                ["/usr/bin/osascript", "-l", "JavaScript", "-e", _APPLE_VOICES_JS],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            out = ""
+        _apple_voices = parse_apple_voices(out)
+    return _apple_voices
+
+def apple_voice_for(text: str, configured: str, voices) -> str:
+    """The Apple voice for this text. Devanagari goes to an installed Hindi
+    voice; everything else to APPLE_VOICE, else the best Premium or Enhanced
+    English voice, else "" (the system voice)."""
+    if has_devanagari(text):
+        hindi = best_apple_voice(voices, "hi")
+        if hindi:
+            return hindi
+    return configured or best_apple_voice(voices, "en", min_quality=2)
 
 def play_child(argv, temp_path=None):
     """Run a player process to the end, so stop/pause/now keep working."""
@@ -786,7 +894,7 @@ CACHE_KEEP = 60
 
 def split_chunks(text: str):
     """Sentence groups: a short first part so sound starts fast, then larger
-    parts. Edge fetches each part while the one before it is playing."""
+    parts. Each part is made while the one before it is playing."""
     sentences = re.split(r'(?<=[.!?\u0964])\s+', text.strip())
     chunks, cur = [], ""
     for s in sentences:
@@ -819,22 +927,63 @@ def _should_abort():
     return os.path.exists(NAV_FILE) or is_muted()
 
 async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
-                     engine: str = "auto"):
-    """Fetch Edge audio part by part and play each part as soon as it is ready,
-    or fall back to macOS `say`. Fetched parts stay cached, so Previous and
-    Replay start at once."""
+                     engine: str = "apple", apple_voice: str = ""):
+    """Make audio part by part (Apple voices or Edge) and play each part as
+    soon as it is ready. Made parts stay cached, so Previous and Replay start
+    at once. With the Apple engine, a first part that cannot be made is read
+    directly by `say`."""
+    engine = resolve_engine(engine)
     if engine == "say":
         play_child(say_args(text, rate))
         return
 
-    import edge_tts
+    if engine == "edge":
+        import edge_tts
+        ext = "mp3"
+
+        def voice_for(t, v):
+            return v
+
+        async def synth(t, v, r, out):
+            await edge_tts.Communicate(t, v, rate=r, volume=volume, pitch=pitch).save(out)
+    else:
+        ext = "m4a"
+        def voice_for(t, v):
+            # The voice list costs one osascript call per process; skip it when
+            # APPLE_VOICE already decides.
+            need_list = not apple_voice or has_devanagari(t)
+            return apple_voice_for(t, apple_voice, installed_apple_voices() if need_list else [])
+
+        async def synth(t, v, r, out):
+            proc = await asyncio.create_subprocess_exec(
+                *apple_synth_args(v, r, out),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await proc.communicate(t.encode())
+            except BaseException:
+                if proc.returncode is None:
+                    proc.kill()
+                raise
+            if proc.returncode != 0:
+                raise RuntimeError(f"say exited {proc.returncode}")
+
+    def cache_folder(t, v):
+        # Apple voices take no volume or pitch; their key is kept apart from Edge's.
+        if engine == "edge":
+            return cache_dir_for(t, v, "", volume, pitch)
+        return cache_dir_for(t, "apple:" + v, "", "", "")
+
+    voice = voice_for(text, voice)
 
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
     # The cache key leaves out the rate: each part's file name carries the
     # rate it was made at, so a speed change mid-answer applies from the next part.
-    folder = cache_dir_for(text, voice, "", volume, pitch)
+    folder = cache_folder(text, voice)
     os.makedirs(folder, exist_ok=True)
     os.utime(folder, None)
     chunks = split_chunks(text)
@@ -844,7 +993,7 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
         return load_config().get("RATE", rate)
 
     def part_path(i, r):
-        return os.path.join(folder, f"{i:04d}_{r}.mp3")
+        return os.path.join(folder, f"{i:04d}_{r}.{ext}")
 
     async def fetch(i, r):
         path = part_path(i, r)
@@ -852,7 +1001,7 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
             return path
         tmp = path + f".{os.getpid()}.{os.urandom(3).hex()}.part"
         try:
-            await edge_tts.Communicate(chunks[i], voice, rate=r, volume=volume, pitch=pitch).save(tmp)
+            await synth(chunks[i], voice, r, tmp)
         except Exception:
             return None
         if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
@@ -883,14 +1032,14 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
             item = peek_next()
             r = live_rate()
             if item and (item["text"], r) != done_for:
-                v = item.get("voice") or voice
-                path = os.path.join(cache_dir_for(item["text"], v, "", volume, pitch), f"0000_{r}.mp3")
+                v = voice_for(item["text"], item.get("voice") or voice)
+                path = os.path.join(cache_folder(item["text"], v), f"0000_{r}.{ext}")
                 if not (os.path.exists(path) and os.path.getsize(path) > 0):
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     tmp = path + f".{os.getpid()}.{os.urandom(3).hex()}.part"
                     try:
                         first = split_chunks(item["text"])[0]
-                        await edge_tts.Communicate(first, v, rate=r, volume=volume, pitch=pitch).save(tmp)
+                        await synth(first, v, r, tmp)
                         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
                             os.replace(tmp, path)
                     except Exception:
@@ -935,8 +1084,8 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                 if producer.done() or prod["rate"] != r:
                     path = await fetch(index, r)
                     if path is None:
-                        if index == 0 and engine == "auto":
-                            play_child(say_args(text, r))
+                        if index == 0 and engine == "apple":
+                            play_child(say_args(text, r, voice))
                         return
                 else:
                     # The producer is fetching this part at this rate: wait for it.
@@ -946,8 +1095,8 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                         if producer.done() or prod["rate"] != r:
                             path = await fetch(index, r)
                             if path is None:
-                                if index == 0 and engine == "auto":
-                                    play_child(say_args(text, r))
+                                if index == 0 and engine == "apple":
+                                    play_child(say_args(text, r, voice))
                                 return
                             break
                         await asyncio.sleep(0.05)
@@ -1060,7 +1209,7 @@ def main():
         cancel()
         try:
             asyncio.run(speak_text(text, voice, cfg["RATE"], cfg["VOLUME"], cfg["PITCH"],
-                               cfg.get("ENGINE", "auto")))
+                               cfg.get("ENGINE", "apple"), cfg.get("APPLE_VOICE", "")))
         except Exception:
             sys.exit(0)
         sys.exit(0)
