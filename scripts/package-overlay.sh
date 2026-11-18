@@ -3,6 +3,14 @@
 #
 #   scripts/package-overlay.sh            # writes dist/ZeroEyesOverlay.zip
 #
+# Without the variables below the app is ad-hoc signed. To sign it with a
+# Developer ID and notarize it (needs a paid Apple Developer account):
+#
+#   xcrun notarytool store-credentials zero-eyes-notary   # once; asks for Apple ID,
+#                                                         # team ID, app-specific password
+#   ZERO_EYES_SIGN_ID="Developer ID Application: Name (TEAMID)" \
+#   ZERO_EYES_NOTARY_PROFILE=zero-eyes-notary scripts/package-overlay.sh
+#
 # Then: gh release create vX.Y.Z dist/ZeroEyesOverlay.zip
 # scripts/install.sh downloads this zip when swiftc is not installed.
 set -euo pipefail
@@ -26,10 +34,39 @@ for SDK in "${sdks[@]}"; do
 done
 [[ $ok -eq 1 ]] || { echo "No installed SDK builds both architectures." >&2; exit 1; }
 lipo -create "$WORK/overlay-arm64" "$WORK/overlay-x86_64" -output "$BINARY"
-codesign --force --sign - "$APP"
+SIGN_ID="${ZERO_EYES_SIGN_ID:-}"
+NOTARY_PROFILE="${ZERO_EYES_NOTARY_PROFILE:-}"
+if [[ -n "$NOTARY_PROFILE" && -z "$SIGN_ID" ]]; then
+  echo "ZERO_EYES_NOTARY_PROFILE needs ZERO_EYES_SIGN_ID." >&2; exit 1
+fi
+if [[ -n "$SIGN_ID" ]]; then
+  # Hardened runtime blocks the microphone unless this entitlement is present.
+  cat > "$WORK/entitlements.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.audio-input</key><true/>
+</dict>
+</plist>
+PLIST
+  codesign --force --options runtime --timestamp \
+    --entitlements "$WORK/entitlements.plist" --sign "$SIGN_ID" "$APP"
+else
+  codesign --force --sign - "$APP"
+fi
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+  ditto -c -k --keepParent "$APP" "$WORK/notarize.zip"
+  xcrun notarytool submit "$WORK/notarize.zip" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP"
+fi
 
 mkdir -p "$DIST"
 rm -f "$DIST/ZeroEyesOverlay.zip"
 ditto -c -k --keepParent "$APP" "$DIST/ZeroEyesOverlay.zip"
 rm -rf "$WORK"
-echo "Packaged    $DIST/ZeroEyesOverlay.zip (arm64 + x86_64)"
+if [[ -n "$NOTARY_PROFILE" ]]; then signed="Developer ID, notarized"
+elif [[ -n "$SIGN_ID" ]]; then signed="Developer ID, not notarized"
+else signed="ad-hoc"; fi
+echo "Packaged    $DIST/ZeroEyesOverlay.zip (arm64 + x86_64, $signed)"
