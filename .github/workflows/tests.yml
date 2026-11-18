@@ -18,3 +18,9 @@ jobs:
           python-version: "3.12"
       - name: Player unit tests
         run: python -m unittest discover -s tests -v
+      - name: Install into a temporary HOME and check it
+        run: |
+          export HOME="$(mktemp -d)"
+          mkdir -p "$HOME/.claude" "$HOME/.config/opencode"
+          scripts/install.sh
+          scripts/install.sh --check
