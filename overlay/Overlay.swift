@@ -102,10 +102,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var expandedViews: [NSView] = []
     private var collapsed = UserDefaults.standard.bool(forKey: "overlayCollapsed")
 
-    private let expandedSize = NSSize(width: 372, height: 88)
+    private let expandedSize = NSSize(width: 404, height: 88)
     private let collapsedSize = NSSize(width: 96, height: 40)
     private let playExpandedFrame = NSRect(x: 44, y: 52, width: 28, height: 26)
-    private let collapseExpandedFrame = NSRect(x: 300, y: 52, width: 28, height: 26)
+    private let collapseExpandedFrame = NSRect(x: 332, y: 52, width: 28, height: 26)
     // Top-right corner of the expanded bar; collapsing keeps it in place.
     private var expandedOrigin = NSPoint.zero
     private var layingOut = false
@@ -143,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let height = expandedSize.height
 
         panel = OverlayPanel(contentRect: NSRect(x: 0, y: 0, width: width, height: height),
-                             styleMask: [.borderless, .nonactivatingPanel],
+                             styleMask: [.borderless, .nonactivatingPanel, .miniaturizable],
                              backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .floating
@@ -192,8 +192,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         collapseButton = makeButton("chevron.up", "Minimize",
                                     #selector(collapseTapped), frame: collapseExpandedFrame)
         collapseButton.contentTintColor = .secondaryLabelColor
+        let dock = makeButton("dock.arrow.down.rectangle", "Send to Dock",
+                              #selector(dockTapped), frame: NSRect(x: 300, y: top, width: 28, height: 26))
+        dock.contentTintColor = .secondaryLabelColor
         let close = makeButton("xmark", "Close overlay",
-                               #selector(closeTapped), frame: NSRect(x: 332, y: top, width: 28, height: 26))
+                               #selector(closeTapped), frame: NSRect(x: 364, y: top, width: 28, height: 26))
         close.contentTintColor = .secondaryLabelColor
 
         rateLabel = NSTextField(labelWithString: "+0%")
@@ -218,19 +221,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
-        titleLabel.frame = NSRect(x: 35, y: 31, width: 323, height: 15)
+        titleLabel.frame = NSRect(x: 35, y: 31, width: 355, height: 15)
 
         statusLabel = NSTextField(labelWithString: "Idle")
         statusLabel.font = .systemFont(ofSize: 10)
         statusLabel.textColor = .tertiaryLabelColor
-        statusLabel.frame = NSRect(x: 14, y: 15, width: 344, height: 13)
+        statusLabel.frame = NSRect(x: 14, y: 15, width: 376, height: 13)
 
         let views: [NSView] = [previous, playButton, stop, next, muteButton, slower, rateLabel, faster,
-                               collapseButton, close, logoView, titleLabel, statusLabel]
+                               collapseButton, dock, close, logoView, titleLabel, statusLabel]
         for view in views {
             effect.addSubview(view)
         }
-        expandedViews = [previous, stop, next, muteButton, slower, rateLabel, faster, close,
+        expandedViews = [previous, stop, next, muteButton, slower, rateLabel, faster, dock, close,
                          logoView, titleLabel, statusLabel]
 
         if let saved = UserDefaults.standard.string(forKey: "overlayOrigin") {
@@ -325,7 +328,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refresh() {
-        let state = PlayerState.read()
+        render(PlayerState.read())
+    }
+
+    private func render(_ state: PlayerState) {
         latest = state
 
         let playing = state.state == "playing"
@@ -360,18 +366,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func act(_ arguments: [String]) {
+    // Show the expected result at once; the next file read confirms it.
+    private func act(_ arguments: [String], expect: ((inout PlayerState) -> Void)? = nil) {
         runPlayer(arguments)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.refresh() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in self?.refresh() }
+        if let expect = expect {
+            var state = latest
+            expect(&state)
+            render(state)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in self?.refresh() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.refresh() }
+    }
+
+    private func expectLoading(_ state: inout PlayerState) {
+        state.state = "playing"
+        state.text = ""
     }
 
     @objc private func playTapped() {
-        act(latest.state == "idle" ? ["--replay"] : ["--pause"])
+        switch latest.state {
+        case "idle": act(["--replay"], expect: expectLoading)
+        case "paused": act(["--pause"]) { $0.state = "playing" }
+        default: act(["--pause"]) { $0.state = "paused" }
+        }
     }
 
     @objc private func stopTapped() {
-        act(["--stop"])
+        act(["--stop"]) { $0.state = "idle"; $0.queue = 0 }
     }
 
     @objc private func muteTapped() {
@@ -379,11 +400,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func nextTapped() {
-        act(["--next"])
+        act(["--next"], expect: expectLoading)
     }
 
     @objc private func previousTapped() {
-        act(["--previous"])
+        act(["--previous"], expect: expectLoading)
     }
 
     @objc private func slowerTapped() {
@@ -394,6 +415,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         act(["--rate-up"])
     }
 
+    // Minimize into the Dock; clicking the Dock icon brings the bar back.
+    @objc private func dockTapped() {
+        panel.miniaturize(nil)
+        if !panel.isMiniaturized { panel.orderOut(nil) }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if panel.isMiniaturized { panel.deminiaturize(nil) }
+        panel.orderFrontRegardless()
+        return true
+    }
+
     @objc private func closeTapped() {
         NSApp.terminate(nil)
     }
@@ -401,6 +434,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.delegate = delegate
 app.run()

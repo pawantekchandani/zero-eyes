@@ -23,7 +23,6 @@ import re
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 
@@ -238,39 +237,31 @@ def stop_playback():
             pass
 
 def toggle_pause():
-    """Pauses or resumes ongoing speech playback using SIGSTOP / SIGCONT."""
-    if not is_playing():
+    """Pause or resume. Works while audio plays (SIGSTOP / SIGCONT on afplay)
+    and also while the next part is still being fetched: the flag alone then
+    holds the player before it starts the next part."""
+    afplay_pid = is_playing()
+    if not afplay_pid and not worker_alive():
         return False
-
-    afplay_pid = None
-    if os.path.exists(AFPLAY_PID_FILE):
-        try:
-            with open(AFPLAY_PID_FILE, "r") as f:
-                afplay_pid = int(f.read().strip())
-        except Exception:
-            pass
-
-    if not afplay_pid:
-        return False
-
     if os.path.exists(PAUSED_FLAG):
-        # Resume
         try:
-            os.kill(afplay_pid, signal.SIGCONT)
             os.remove(PAUSED_FLAG)
-            return True
-        except Exception:
+        except OSError:
             pass
-    else:
-        # Pause
+        if afplay_pid:
+            try:
+                os.kill(afplay_pid, signal.SIGCONT)
+            except Exception:
+                pass
+        return True
+    with open(PAUSED_FLAG, "w") as f:
+        f.write("1")
+    if afplay_pid:
         try:
             os.kill(afplay_pid, signal.SIGSTOP)
-            with open(PAUSED_FLAG, "w") as f:
-                f.write("1")
-            return True
         except Exception:
             pass
-    return False
+    return True
 
 def is_playing():
     """Checks if speech playback is currently active or paused."""
@@ -369,6 +360,16 @@ def pop_next():
                 os.remove(path)
             except OSError:
                 pass
+    return None
+
+def peek_next():
+    """The oldest waiting item, without taking it off the queue."""
+    for name in queue_items():
+        try:
+            with open(os.path.join(QUEUE_DIR, name), "r") as f:
+                return json.load(f)
+        except Exception:
+            continue
     return None
 
 def clear_queue():
@@ -583,6 +584,7 @@ def play_item(item, cfg):
     # drains instead of growing into a backlog of unheard answers.
     if is_muted():
         return
+    cfg = load_config()  # read now, so a speed change applies to this item
     try:
         asyncio.run(speak_text(
             item["text"],
@@ -659,8 +661,18 @@ def clean_text_for_speech(text: str) -> str:
     if not text:
         return ""
     # Strip markdown tables
-    text = re.sub(r'\|[^\n]+\|\n\|[-:\s|]+\|\n(?:\|[^\n]+\|\n?)*', ' Table omitted. ', text)
-    text = re.sub(r'\|[^\n]+\|', ' ', text)
+    def _speak_table(m):
+        lines = [l.strip() for l in m.group(0).strip().split('\n') if l.strip()]
+        cells = lambda l: [c.strip() for c in l.strip('|').split('|')]
+        headers = cells(lines[0])
+        out = []
+        for row in lines[2:]:
+            vals = cells(row)
+            parts = [f"{h}: {v}" if h else v for h, v in zip(headers, vals) if v]
+            out.append(', '.join(parts) + '.')
+        return ' Table. ' + ' '.join(out) + ' End of table. '
+    text = re.sub(r'\|[^\n]+\|\n\|[-:\s|]+\|\n(?:\|[^\n]+\|\n?)*', _speak_table, text)
+    text = re.sub(r'\|[^\n]+\|', lambda m: ' ' + m.group(0).replace('|', ', ') + ' ', text)
     # Strip markdown code blocks
     text = re.sub(r'```[\s\S]*?```', ' Code block omitted. ', text)
     # Strip inline backticks
@@ -769,47 +781,194 @@ def play_child(argv, temp_path=None):
     signal.signal(signal.SIGINT, handle_signal)
     proc.wait()
 
+CACHE_DIR = os.path.join(STATE_DIR, "cache")
+CACHE_KEEP = 60
+
+def split_chunks(text: str):
+    """Sentence groups: a short first part so sound starts fast, then larger
+    parts. Edge fetches each part while the one before it is playing."""
+    sentences = re.split(r'(?<=[.!?\u0964])\s+', text.strip())
+    chunks, cur = [], ""
+    for s in sentences:
+        limit = 160 if not chunks else 250
+        if cur and len(cur) + len(s) + 1 > limit:
+            chunks.append(cur)
+            cur = s
+        else:
+            cur = f"{cur} {s}".strip()
+    if cur:
+        chunks.append(cur)
+    return chunks or [text]
+
+def cache_dir_for(text, voice, rate, volume, pitch):
+    import hashlib
+    key = hashlib.sha1("\x00".join([text, voice, rate, volume, pitch]).encode()).hexdigest()
+    return os.path.join(CACHE_DIR, key)
+
+def prune_cache():
+    try:
+        dirs = [os.path.join(CACHE_DIR, d) for d in os.listdir(CACHE_DIR)]
+        dirs.sort(key=os.path.getmtime)
+        import shutil
+        for d in dirs[:-CACHE_KEEP]:
+            shutil.rmtree(d, ignore_errors=True)
+    except Exception:
+        pass
+
+def _should_abort():
+    return os.path.exists(NAV_FILE) or is_muted()
+
 async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                      engine: str = "auto"):
-    """Synthesize with Edge's Read Aloud voices, or fall back to macOS `say`."""
+    """Fetch Edge audio part by part and play each part as soon as it is ready,
+    or fall back to macOS `say`. Fetched parts stay cached, so Previous and
+    Replay start at once."""
     if engine == "say":
         play_child(say_args(text, rate))
         return
 
     import edge_tts
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_audio:
-        temp_path = temp_audio.name
+
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    # The cache key leaves out the rate: each part's file name carries the
+    # rate it was made at, so a speed change mid-answer applies from the next part.
+    folder = cache_dir_for(text, voice, "", volume, pitch)
+    os.makedirs(folder, exist_ok=True)
+    os.utime(folder, None)
+    chunks = split_chunks(text)
+    total = len(chunks)
+
+    def live_rate():
+        return load_config().get("RATE", rate)
+
+    def part_path(i, r):
+        return os.path.join(folder, f"{i:04d}_{r}.mp3")
+
+    async def fetch(i, r):
+        path = part_path(i, r)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+        tmp = path + f".{os.getpid()}.{os.urandom(3).hex()}.part"
+        try:
+            await edge_tts.Communicate(chunks[i], voice, rate=r, volume=volume, pitch=pitch).save(tmp)
+        except Exception:
+            return None
+        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            return None
+        os.replace(tmp, path)
+        return path
+
+    async def produce():
+        # Fetch ahead at the current rate. Restart from the next needed part
+        # when the rate changes.
+        i = 0
+        while i < total:
+            r = live_rate()
+            prod["rate"] = r
+            if await fetch(i, r) is None:
+                return
+            i += 1
+        prune_cache()
+
+    prod = {"rate": None}
+
+    async def prefetch_next():
+        # Once this answer is fetched, fetch the first part of the next waiting
+        # answer, so it starts with no network gap when this one ends.
+        await producer
+        done_for = None
+        while True:
+            item = peek_next()
+            r = live_rate()
+            if item and (item["text"], r) != done_for:
+                v = item.get("voice") or voice
+                path = os.path.join(cache_dir_for(item["text"], v, "", volume, pitch), f"0000_{r}.mp3")
+                if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    tmp = path + f".{os.getpid()}.{os.urandom(3).hex()}.part"
+                    try:
+                        first = split_chunks(item["text"])[0]
+                        await edge_tts.Communicate(first, v, rate=r, volume=volume, pitch=pitch).save(tmp)
+                        if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                            os.replace(tmp, path)
+                    except Exception:
+                        pass
+                    finally:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                done_for = (item["text"], r)
+            await asyncio.sleep(0.3)
+
+    producer = asyncio.create_task(produce())
+    prefetcher = asyncio.create_task(prefetch_next())
+
+    current = {"proc": None}
+
+    def handle_signal(sig, frame):
+        proc = current["proc"]
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        stop_playback()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
     try:
-        with open(PID_FILE, "w") as f:
-            f.write(str(os.getpid()))
-
-        try:
-            comm = edge_tts.Communicate(text, voice, rate=rate, volume=volume, pitch=pitch)
-            await comm.save(temp_path)
-        except Exception:
-            if engine == "auto":
-                play_child(say_args(text, rate))
-            return
-
-        if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
-            if engine == "auto":
-                play_child(say_args(text, rate))
-            return
-
-        # A next/previous/replay arrived while this item was being synthesized,
-        # or the listener muted: skip starting it and let the worker loop carry on.
-        if os.path.exists(NAV_FILE) or is_muted():
-            return
-
-        play_child(["/usr/bin/afplay", temp_path], temp_path)
+        index = 0
+        while index < total:
+            # Hold here while paused between parts.
+            while os.path.exists(PAUSED_FLAG):
+                if _should_abort():
+                    return
+                await asyncio.sleep(0.05)
+            if _should_abort():
+                return
+            r = live_rate()
+            path = part_path(index, r)
+            if not (os.path.exists(path) and os.path.getsize(path) > 0):
+                if producer.done() or prod["rate"] != r:
+                    path = await fetch(index, r)
+                    if path is None:
+                        if index == 0 and engine == "auto":
+                            play_child(say_args(text, r))
+                        return
+                else:
+                    # The producer is fetching this part at this rate: wait for it.
+                    while not (os.path.exists(path) and os.path.getsize(path) > 0):
+                        if _should_abort():
+                            return
+                        if producer.done() or prod["rate"] != r:
+                            path = await fetch(index, r)
+                            if path is None:
+                                if index == 0 and engine == "auto":
+                                    play_child(say_args(text, r))
+                                return
+                            break
+                        await asyncio.sleep(0.05)
+            proc = await asyncio.create_subprocess_exec("/usr/bin/afplay", path)
+            current["proc"] = proc
+            with open(AFPLAY_PID_FILE, "w") as f:
+                f.write(str(proc.pid))
+            await proc.wait()
+            current["proc"] = None
+            if proc.returncode != 0 or _should_abort():
+                return  # killed by Next / Previous / Stop / Mute
+            index += 1
     finally:
-        stop_playback()
-        if os.path.exists(temp_path):
+        prefetcher.cancel()
+        if producer and not producer.done():
+            producer.cancel()
             try:
-                os.remove(temp_path)
-            except OSError:
+                await producer
+            except BaseException:
                 pass
+        stop_playback()
 
 def main():
     ensure_state_dir()
