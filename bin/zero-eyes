@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zero Eyes — read an AI coding agent's answers aloud on macOS.
+"""Zero Eyes — read an AI coding agent's answers aloud on macOS and Linux.
 
 The shared player behind every Zero Eyes surface: the auto-read hooks, the
 macOS Services read (select text, press the shortcut), and the floating
@@ -13,7 +13,12 @@ when chosen, by Microsoft Edge's Read Aloud voice service through the
     zero-eyes --rate-up | --rate-down
     zero-eyes --reply                  # push-to-talk: start, then stop and send
 
-State lives in ~/Library/Application Support/Zero Eyes; configuration in
+On Linux the player alone runs (no overlay, no Services): speech comes from
+`piper` or `espeak-ng`, or Edge, and plays through the first audio player found
+(`paplay`, `pw-play`, `ffplay`, `mpv`, `aplay`).
+
+State lives in ~/Library/Application Support/Zero Eyes on macOS and in
+$XDG_STATE_HOME/zero-eyes (~/.local/state/zero-eyes) on Linux; configuration in
 ~/.config/zero-eyes/config. Both are per-user and private.
 """
 import asyncio
@@ -21,14 +26,28 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import time
 import uuid
 
-STATE_DIR = os.environ.get("ZERO_EYES_STATE_DIR") or os.path.join(
-    os.path.expanduser("~/Library/Application Support"), "Zero Eyes")
+IS_MAC = sys.platform == "darwin"
+
+def default_state_dir(platform=None, env=None):
+    """~/Library/Application Support/Zero Eyes on macOS; the XDG state folder
+    ($XDG_STATE_HOME, else ~/.local/state) plus zero-eyes elsewhere."""
+    platform = platform or sys.platform
+    env = os.environ if env is None else env
+    if platform == "darwin":
+        return os.path.join(os.path.expanduser("~/Library/Application Support"), "Zero Eyes")
+    base = env.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):  # the XDG spec says to ignore relative paths
+        base = os.path.expanduser("~/.local/state")
+    return os.path.join(base, "zero-eyes")
+
+STATE_DIR = os.environ.get("ZERO_EYES_STATE_DIR") or default_state_dir()
 
 PID_FILE = os.path.join(STATE_DIR, "player.pid")
 AFPLAY_PID_FILE = os.path.join(STATE_DIR, "afplay.pid")
@@ -62,8 +81,8 @@ def load_config():
         "AUTO_READ": "true",
         "MUTED": "false",
         # apple: the Mac's own voices (auto is the same); edge: Edge TTS only;
-        # say: say speaks directly, without files.
-        "ENGINE": "apple",
+        # say: say speaks directly, without files. Linux: see resolve_engine.
+        "ENGINE": "apple" if IS_MAC else "auto",
         "LANGUAGE_HINDI_VOICE": "hi-IN-MadhurNeural",
         # Empty: the best installed English voice (Premium, then Enhanced,
         # then the system voice). Any `say -v` name or voice identifier.
@@ -73,6 +92,8 @@ def load_config():
         "REPLY_LANGUAGE": "en",
         "REPLY_SUBMIT": "false",
         "REPLY_SILENCE": "2",
+        # Linux: path to a piper voice model (.onnx); empty means espeak-ng.
+        "PIPER_MODEL": "",
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -179,6 +200,8 @@ def detect_origin():
     named = os.environ.get("ZERO_EYES_ORIGIN", "").strip()
     if named:
         return named
+    if not IS_MAC:
+        return "Read aloud"
     pid = os.getpid()
     for _ in range(15):
         name = _app_name_for(pid)
@@ -753,7 +776,7 @@ def ensure_overlay():
     The binary is exec'd directly: LaunchServices refuses to `open` an ad-hoc
     signed local app on macOS 27 (error -10825), while a direct launch works.
     """
-    if not os.path.isdir(OVERLAY_APP):
+    if not IS_MAC or not os.path.isdir(OVERLAY_APP):
         return
     try:
         running = subprocess.run(
@@ -794,6 +817,7 @@ def play_item(item, cfg):
             cfg["PITCH"],
             cfg.get("ENGINE", "apple"),
             cfg.get("APPLE_VOICE", ""),
+            piper_model_path(cfg),
         ))
     except Exception:
         pass
@@ -920,6 +944,8 @@ def clean_text_for_speech(text: str) -> str:
 
 def get_selected_text_via_applescript():
     """Attempts to copy selected text via Cmd+C, or falls back to current clipboard."""
+    if not IS_MAC:
+        return ""
     script = '''
     set savedClipboard to the clipboard
     tell application "System Events"
@@ -954,22 +980,112 @@ def select_voice(text: str, default_voice: str, hindi_voice: str = "hi-IN-Madhur
 
 ENGINES = ("apple", "edge", "say")
 
-def resolve_engine(value: str) -> str:
+def resolve_engine(value: str, platform=None, piper_ready: bool = False) -> str:
     """The engine to use for a configured ENGINE value.
 
-    `auto` (the old default) and anything unknown mean `apple`, so an old
-    config keeps working without the unofficial Edge endpoint. Edge is used
+    macOS: `auto` (the old default) and anything unknown mean `apple`, so an
+    old config keeps working without the unofficial Edge endpoint. Edge is used
     only when it is asked for by name.
+
+    Linux: `edge` and `espeak` are kept. Everything else (`auto`, `apple`,
+    `piper`, unknown) means the local engine: `piper` when it is ready (the
+    binary and a PIPER_MODEL file exist), else `espeak`.
     """
     value = (value or "").strip().lower()
-    return value if value in ENGINES else "apple"
+    if (platform or sys.platform) == "darwin":
+        return value if value in ENGINES else "apple"
+    if value in ("edge", "espeak"):
+        return value
+    return "piper" if piper_ready else "espeak"
 
-def rate_to_wpm(rate: str):
-    """Edge's +N% as `say` words per minute (175 is 0%), or None if unreadable."""
+def piper_model_path(cfg) -> str:
+    return os.path.expanduser(cfg.get("PIPER_MODEL", "").strip())
+
+def piper_ready(model: str, which=shutil.which) -> bool:
+    """True when the piper binary is on PATH and the voice model exists."""
+    return bool(model and os.path.isfile(model) and which("piper"))
+
+def espeak_binary(which=shutil.which):
+    """espeak-ng, else the older espeak, else None."""
+    return which("espeak-ng") or which("espeak")
+
+def rate_percent(rate: str):
+    """Edge's +N% as an int, or None if unreadable."""
     match = re.match(r'^([+-]?)(\d+)%$', (rate or "").strip())
     if not match:
         return None
-    percent = int(match.group(2)) * (-1 if match.group(1) == "-" else 1)
+    return int(match.group(2)) * (-1 if match.group(1) == "-" else 1)
+
+def rate_to_length_scale(rate: str):
+    """Edge's +N% as piper's --length_scale (1.0 is 0%; smaller is faster),
+    or None if unreadable. Speed is clamped to 0.5x .. 2.5x, like `say`."""
+    percent = rate_percent(rate)
+    if percent is None:
+        return None
+    speed = max(0.5, min(2.5, 1 + percent / 100))
+    return round(1 / speed, 2)
+
+def piper_synth_args(model: str, rate: str, out_path: str):
+    """`piper` command line that writes one part to a WAV file; text on stdin."""
+    args = ["piper", "--model", model]
+    scale = rate_to_length_scale(rate)
+    if scale is not None:
+        args += ["--length_scale", str(scale)]
+    return args + ["--output_file", out_path]
+
+def espeak_synth_args(binary: str, voice: str, rate: str, out_path: str):
+    """espeak-ng command line that writes one part to a WAV file; text on
+    stdin. Its default speed is 175 words per minute, the same as `say`."""
+    args = [binary]
+    if voice:
+        args += ["-v", voice]
+    wpm = rate_to_wpm(rate)
+    if wpm:
+        args += ["-s", str(wpm)]
+    return args + ["-w", out_path, "--stdin"]
+
+# Linux audio players, in order of preference, and the formats each can play.
+# paplay and pw-play read files through libsndfile, aplay only WAV, so Edge's
+# MP3 needs ffplay or mpv.
+LINUX_PLAYERS = (
+    (["paplay"], ("wav",)),
+    (["pw-play"], ("wav",)),
+    (["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"], ("wav", "mp3")),
+    (["mpv", "--no-video", "--really-quiet"], ("wav", "mp3")),
+    (["aplay", "-q"], ("wav",)),
+)
+
+def audio_player(ext: str, platform=None, which=shutil.which):
+    """Command line (without the file) that plays one part, or None."""
+    if (platform or sys.platform) == "darwin":
+        return ["/usr/bin/afplay"]
+    for argv, formats in LINUX_PLAYERS:
+        if ext in formats:
+            path = which(argv[0])
+            if path:
+                return [path] + argv[1:]
+    return None
+
+def engine_ext(engine: str) -> str:
+    return {"edge": "mp3", "apple": "m4a"}.get(engine, "wav")
+
+def linux_problem(cfg):
+    """Why Linux speech cannot work with this config, or None."""
+    engine = resolve_engine(cfg.get("ENGINE", ""), "linux",
+                            piper_ready(piper_model_path(cfg)))
+    if engine == "espeak" and not espeak_binary():
+        return "no speech engine: install espeak-ng, or piper and set PIPER_MODEL"
+    if not audio_player(engine_ext(engine), "linux"):
+        if engine == "edge":
+            return "Edge voices are MP3: install ffmpeg (ffplay) or mpv to play them"
+        return "no audio player: install pulseaudio-utils (paplay), pipewire (pw-play), ffmpeg, mpv or alsa-utils (aplay)"
+    return None
+
+def rate_to_wpm(rate: str):
+    """Edge's +N% as `say` words per minute (175 is 0%), or None if unreadable."""
+    percent = rate_percent(rate)
+    if percent is None:
+        return None
     return max(90, min(420, round(175 * (1 + percent / 100))))
 
 def say_args(text: str, rate: str, voice: str = ""):
@@ -1121,16 +1237,42 @@ def prune_cache():
 def _should_abort():
     return os.path.exists(NAV_FILE) or is_muted()
 
+async def _run_synth(argv, text):
+    """Run one synthesis command with the text on stdin; raise if it fails."""
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await proc.communicate(text.encode())
+    except BaseException:
+        if proc.returncode is None:
+            proc.kill()
+        raise
+    if proc.returncode != 0:
+        raise RuntimeError(f"{argv[0]} exited {proc.returncode}")
+
 async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
-                     engine: str = "apple", apple_voice: str = ""):
-    """Make audio part by part (Apple voices or Edge) and play each part as
-    soon as it is ready. Made parts stay cached, so Previous and Replay start
-    at once. With the Apple engine, a first part that cannot be made is read
-    directly by `say`."""
-    engine = resolve_engine(engine)
+                     engine: str = "apple", apple_voice: str = "", piper_model: str = ""):
+    """Make audio part by part (Apple voices, piper, espeak-ng or Edge) and
+    play each part as soon as it is ready. Made parts stay cached, so Previous
+    and Replay start at once. With the Apple engine, a first part that cannot
+    be made is read directly by `say`."""
+    engine = resolve_engine(engine, piper_ready=not IS_MAC and piper_ready(piper_model))
     if engine == "say":
         play_child(say_args(text, rate))
         return
+
+    player = audio_player(engine_ext(engine))
+    if not player:
+        debug(f"no audio player for {engine_ext(engine)}")
+        return
+    # Linux players may print or read the terminal; afplay is left as it was.
+    player_io = {} if IS_MAC else {"stdin": asyncio.subprocess.DEVNULL,
+                                   "stdout": asyncio.subprocess.DEVNULL,
+                                   "stderr": asyncio.subprocess.DEVNULL}
 
     if engine == "edge":
         import edge_tts
@@ -1141,6 +1283,24 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
 
         async def synth(t, v, r, out):
             await edge_tts.Communicate(t, v, rate=r, volume=volume, pitch=pitch).save(out)
+    elif engine == "piper":
+        ext = "wav"
+
+        def voice_for(t, v):
+            return piper_model
+
+        async def synth(t, v, r, out):
+            await _run_synth(piper_synth_args(v, r, out), t)
+    elif engine == "espeak":
+        ext = "wav"
+        binary = espeak_binary() or "espeak-ng"
+
+        def voice_for(t, v):
+            # espeak-ng's default voice is English; Devanagari gets Hindi.
+            return "hi" if has_devanagari(t) else ""
+
+        async def synth(t, v, r, out):
+            await _run_synth(espeak_synth_args(binary, v, r, out), t)
     else:
         ext = "m4a"
         def voice_for(t, v):
@@ -1169,7 +1329,7 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
         # Apple voices take no volume or pitch; their key is kept apart from Edge's.
         if engine == "edge":
             return cache_dir_for(t, v, "", volume, pitch)
-        return cache_dir_for(t, "apple:" + v, "", "", "")
+        return cache_dir_for(t, engine + ":" + v, "", "", "")
 
     voice = voice_for(text, voice)
 
@@ -1295,7 +1455,7 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                                 return
                             break
                         await asyncio.sleep(0.05)
-            proc = await asyncio.create_subprocess_exec("/usr/bin/afplay", path)
+            proc = await asyncio.create_subprocess_exec(*player, path, **player_io)
             current["proc"] = proc
             with open(AFPLAY_PID_FILE, "w") as f:
                 f.write(str(proc.pid))
@@ -1362,6 +1522,11 @@ def main():
         print(adjust_rate(-10))
         sys.exit(0)
 
+    if not IS_MAC and any(a.startswith("--reply") for a in args):
+        print("zero-eyes: --reply is not supported on Linux (it needs the macOS overlay)",
+              file=sys.stderr)
+        sys.exit(2)
+
     if "--reply" in args:
         sys.exit(reply_toggle())
 
@@ -1411,13 +1576,18 @@ def main():
         sys.exit(0)
 
     ensure_overlay()
+    if not IS_MAC:
+        problem = linux_problem(cfg)
+        if problem:
+            print(f"zero-eyes: {problem}", file=sys.stderr)
     voice = select_voice(text, cfg["VOICE"], cfg.get("LANGUAGE_HINDI_VOICE", "hi-IN-MadhurNeural"))
 
     if force:
         cancel()
         try:
             asyncio.run(speak_text(text, voice, cfg["RATE"], cfg["VOLUME"], cfg["PITCH"],
-                               cfg.get("ENGINE", "apple"), cfg.get("APPLE_VOICE", "")))
+                               cfg.get("ENGINE", "apple"), cfg.get("APPLE_VOICE", ""),
+                               piper_model_path(cfg)))
         except Exception:
             sys.exit(0)
         sys.exit(0)
