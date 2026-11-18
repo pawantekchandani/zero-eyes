@@ -66,6 +66,13 @@ the player with `--stop`, `--next`, `--previous`, `--replay`, `--pause`, `--mute
 `--rate-up`, `--rate-down`. The panel is started at login by a LaunchAgent and
 re-started by the player whenever anything is spoken.
 
+Voice reply is the one exception to "no IPC". `zero-eyes --reply` sends `SIGUSR1`
+to the pid in `overlay.pid`, and the overlay starts or stops recording. The overlay
+calls `--reply-begin` (checks `whisper-cli`, stops speech), records with
+`AVAudioRecorder` to `reply.wav`, then calls `--reply-transcribe` (runs `whisper-cli`,
+deletes the file) and pastes the text with a synthetic ⌘V. Recording and pasting live
+in the overlay so that Microphone and Accessibility permission belong to one app.
+
 ## Failure behaviour
 
 - `edge-tts` missing, offline, or the endpoint changed → silence with

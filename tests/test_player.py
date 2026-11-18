@@ -165,5 +165,59 @@ class QueueCapTests(unittest.TestCase):
         self.assertEqual(texts, [f"item {i}" for i in range(3, 3 + ze.QUEUE_WAITING_MAX)])
 
 
+class ReplyTests(unittest.TestCase):
+    def test_clean_transcript_drops_non_speech_markers(self):
+        out = "[BLANK_AUDIO]\n Please run the tests (music) again. *sighs*\n"
+        self.assertEqual(ze.clean_transcript(out), "Please run the tests again.")
+
+    def test_clean_transcript_of_only_markers_is_empty(self):
+        self.assertEqual(ze.clean_transcript(" [BLANK_AUDIO] \n"), "")
+
+    def test_reply_settings_defaults(self):
+        settings = ze.reply_settings({})
+        self.assertEqual(settings["model"], os.path.join(ze.MODELS_DIR, ze.WHISPER_MODEL_NAME))
+        self.assertTrue(settings["default_model"])
+        self.assertEqual(settings["language"], "en")
+        self.assertFalse(settings["submit"])
+        self.assertEqual(settings["silence"], 2.0)
+
+    def test_reply_settings_from_config(self):
+        settings = ze.reply_settings({
+            "REPLY_MODEL": "~/models/ggml-small.bin",
+            "REPLY_LANGUAGE": "hi",
+            "REPLY_SUBMIT": "true",
+            "REPLY_SILENCE": "0",
+        })
+        self.assertEqual(settings["model"], os.path.expanduser("~/models/ggml-small.bin"))
+        self.assertFalse(settings["default_model"])
+        self.assertEqual(settings["language"], "hi")
+        self.assertTrue(settings["submit"])
+        self.assertEqual(settings["silence"], 0.0)
+
+    def test_reply_settings_bad_silence_falls_back(self):
+        self.assertEqual(ze.reply_settings({"REPLY_SILENCE": "soon"})["silence"], 2.0)
+        self.assertEqual(ze.reply_settings({"REPLY_SILENCE": "-3"})["silence"], 0.0)
+
+    def test_whisper_command(self):
+        self.assertEqual(
+            ze.whisper_command("/bin/whisper-cli", "/m.bin", "/r.wav", "en"),
+            ["/bin/whisper-cli", "-m", "/m.bin", "-f", "/r.wav", "-l", "en", "-nt", "-np"],
+        )
+
+    def test_save_config_keeps_reply_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config")
+            with open(path, "w") as f:
+                f.write('MUTED="false"\nREPLY_SUBMIT="true"\nREPLY_LANGUAGE="hi"\n')
+            with mock.patch.object(ze, "CONFIG_FILE", path):
+                cfg = ze.load_config()
+                cfg["MUTED"] = "true"
+                ze.save_config(cfg)
+                saved = ze.load_config()
+        self.assertEqual(saved["MUTED"], "true")
+        self.assertEqual(saved["REPLY_SUBMIT"], "true")
+        self.assertEqual(saved["REPLY_LANGUAGE"], "hi")
+
+
 if __name__ == "__main__":
     unittest.main()

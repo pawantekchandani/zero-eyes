@@ -1,3 +1,4 @@
+import AVFoundation
 import Cocoa
 
 // Floating controls for the shared Zero Eyes player. State is read straight
@@ -80,6 +81,213 @@ func runPlayer(_ arguments: [String]) {
     try? process.run()
 }
 
+// Run the player and hand back what it printed, off the main thread.
+func runPlayerOutput(_ arguments: [String], completion: @escaping (Int32, Data) -> Void) {
+    DispatchQueue.global(qos: .userInitiated).async {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: playerPath)
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        var data = Data()
+        var status: Int32 = 1
+        if (try? process.run()) != nil {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            status = process.terminationStatus
+        }
+        DispatchQueue.main.async { completion(status, data) }
+    }
+}
+
+// Push-to-talk reply. The overlay records and pastes, so Microphone and
+// Accessibility are asked for once, for this app. The player stops speech,
+// checks Whisper and transcribes (zero-eyes --reply-begin / --reply-transcribe).
+final class ReplyRecorder {
+    enum Phase { case idle, starting, recording, transcribing }
+
+    private(set) var phase = Phase.idle
+    var onChange: (() -> Void)?
+
+    private var recorder: AVAudioRecorder?
+    private var meterTimer: Timer?
+    private var silenceLimit: Double = 2
+    private var heardVoice = false
+    private var lastVoice = Date()
+    private var startedAt = Date()
+    private var askedForAccessibility = false
+
+    private let wavPath = stateFile("reply.wav")
+    private let voiceLevel: Float = -40      // dBFS; quieter counts as silence
+    private let maxSeconds: Double = 120
+
+    func toggle() {
+        switch phase {
+        case .idle: begin()
+        case .recording: finish()
+        case .starting, .transcribing: break
+        }
+    }
+
+    private func setPhase(_ next: Phase) {
+        phase = next
+        onChange?()
+    }
+
+    private func say(_ text: String) {
+        runPlayer([text])
+    }
+
+    private func begin() {
+        setPhase(.starting)
+        runPlayerOutput(["--reply-begin"]) { [weak self] status, data in
+            guard let self else { return }
+            guard status == 0 else { self.setPhase(.idle); return }
+            let settings = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            self.silenceLimit = settings?["silence"] as? Double ?? 2
+            self.withMicrophone { granted in
+                if granted {
+                    self.startRecording()
+                } else {
+                    self.setPhase(.idle)
+                    self.say("Microphone access is off for Zero Eyes Overlay. "
+                             + "Turn it on in System Settings, Privacy and Security, Microphone.")
+                }
+            }
+        }
+    }
+
+    private func withMicrophone(_ completion: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: completion(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { completion(granted) }
+            }
+        default: completion(false)
+        }
+    }
+
+    private func startRecording() {
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16000,           // what Whisper expects
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+        ]
+        try? FileManager.default.removeItem(atPath: wavPath)
+        guard let recorder = try? AVAudioRecorder(url: URL(fileURLWithPath: wavPath), settings: settings),
+              recorder.record() else {
+            setPhase(.idle)
+            say("The microphone could not be started.")
+            return
+        }
+        recorder.isMeteringEnabled = true
+        self.recorder = recorder
+        heardVoice = false
+        startedAt = Date()
+        lastVoice = startedAt
+        NSSound(named: "Tink")?.play()
+        setPhase(.recording)
+
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in self?.checkLevel() }
+        RunLoop.main.add(timer, forMode: .common)
+        meterTimer = timer
+    }
+
+    // Stop on its own after the user stops talking, or at the time limit.
+    private func checkLevel() {
+        guard let recorder else { return }
+        recorder.updateMeters()
+        let now = Date()
+        if recorder.averagePower(forChannel: 0) > voiceLevel {
+            heardVoice = true
+            lastVoice = now
+        }
+        let quiet = silenceLimit > 0 && heardVoice && now.timeIntervalSince(lastVoice) >= silenceLimit
+        if quiet || now.timeIntervalSince(startedAt) >= maxSeconds {
+            finish()
+        }
+    }
+
+    private func finish() {
+        meterTimer?.invalidate()
+        meterTimer = nil
+        recorder?.stop()
+        recorder = nil
+        NSSound(named: "Pop")?.play()
+
+        // Whisper invents words ("you") for silence, so a recording with no
+        // voice in it is not transcribed at all.
+        guard heardVoice else {
+            try? FileManager.default.removeItem(atPath: wavPath)
+            setPhase(.idle)
+            say("I did not catch that.")
+            return
+        }
+        setPhase(.transcribing)
+        runPlayerOutput(["--reply-transcribe", wavPath]) { [weak self] _, data in
+            guard let self else { return }
+            let result = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let text = result?["text"] as? String ?? ""
+            if !text.isEmpty {
+                self.deliver(text, submit: result?["submit"] as? Bool ?? false)
+            }
+            self.setPhase(.idle)
+        }
+    }
+
+    // Paste into the frontmost app with Cmd+V and put the old clipboard back.
+    // Without Accessibility the text stays on the clipboard for the user.
+    private func deliver(_ text: String, submit: Bool) {
+        let pasteboard = NSPasteboard.general
+        guard CGPreflightPostEventAccess() else {
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            if !askedForAccessibility {
+                askedForAccessibility = true
+                CGRequestPostEventAccess()
+            }
+            say("Reply copied. Press Command V.")
+            return
+        }
+
+        let saved: [NSPasteboardItem] = (pasteboard.pasteboardItems ?? []).map { item in
+            let copy = NSPasteboardItem()
+            for type in item.types {
+                if let data = item.data(forType: type) { copy.setData(data, forType: type) }
+            }
+            return copy
+        }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        let ours = pasteboard.changeCount
+
+        let source = CGEventSource(stateID: .combinedSessionState)
+        func press(_ key: CGKeyCode, _ flags: CGEventFlags) {
+            for down in [true, false] {
+                let event = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: down)
+                event?.flags = flags
+                event?.post(tap: .cghidEventTap)
+            }
+        }
+        press(0x09, .maskCommand)                                   // V
+        if submit {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { press(0x24, []) }  // Return
+        }
+        // Give the app time to read the clipboard; skip the restore if
+        // something else has been copied since.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            guard pasteboard.changeCount == ours else { return }
+            pasteboard.clearContents()
+            if !saved.isEmpty { pasteboard.writeObjects(saved) }
+        }
+    }
+}
+
 final class OverlayPanel: NSPanel {
     // Keep keyboard focus where it is: buttons still receive mouse clicks.
     override var canBecomeKey: Bool { false }
@@ -91,6 +299,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var effectView: NSVisualEffectView!
     private var playButton: NSButton!
     private var muteButton: NSButton!
+    private var micButton: NSButton!
+    private let reply = ReplyRecorder()
+    private var replySignal: DispatchSourceSignal?
     private var collapseButton: NSButton!
     private var logoView: NSImageView!
     private var titleLabel: NSTextField!
@@ -102,10 +313,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var expandedViews: [NSView] = []
     private var collapsed = UserDefaults.standard.bool(forKey: "overlayCollapsed")
 
-    private let expandedSize = NSSize(width: 404, height: 88)
+    private let expandedSize = NSSize(width: 436, height: 88)
     private let collapsedSize = NSSize(width: 96, height: 40)
     private let playExpandedFrame = NSRect(x: 44, y: 52, width: 28, height: 26)
-    private let collapseExpandedFrame = NSRect(x: 332, y: 52, width: 28, height: 26)
+    private let collapseExpandedFrame = NSRect(x: 364, y: 52, width: 28, height: 26)
     // Top-right corner of the expanded bar; collapsing keeps it in place.
     private var expandedOrigin = NSPoint.zero
     private var layingOut = false
@@ -113,6 +324,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildPanel()
         refresh()
+
+        // `zero-eyes --reply` (the Zero Eyes Reply service) sends SIGUSR1 to
+        // the pid written here: one signal toggles recording.
+        signal(SIGUSR1, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        source.setEventHandler { [weak self] in self?.reply.toggle() }
+        source.resume()
+        replySignal = source
+        reply.onChange = { [weak self] in self?.refresh() }
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        try? String(getpid()).write(toFile: stateFile("overlay.pid"), atomically: true, encoding: .utf8)
 
         let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -192,11 +415,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         collapseButton = makeButton("chevron.up", "Minimize",
                                     #selector(collapseTapped), frame: collapseExpandedFrame)
         collapseButton.contentTintColor = .secondaryLabelColor
+        micButton = makeButton("mic.fill", "Reply by voice",
+                               #selector(micTapped), frame: NSRect(x: 300, y: top, width: 28, height: 26))
         let dock = makeButton("dock.arrow.down.rectangle", "Send to Dock",
-                              #selector(dockTapped), frame: NSRect(x: 300, y: top, width: 28, height: 26))
+                              #selector(dockTapped), frame: NSRect(x: 332, y: top, width: 28, height: 26))
         dock.contentTintColor = .secondaryLabelColor
         let close = makeButton("xmark", "Close overlay",
-                               #selector(closeTapped), frame: NSRect(x: 364, y: top, width: 28, height: 26))
+                               #selector(closeTapped), frame: NSRect(x: 396, y: top, width: 28, height: 26))
         close.contentTintColor = .secondaryLabelColor
 
         rateLabel = NSTextField(labelWithString: "+0%")
@@ -221,19 +446,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
-        titleLabel.frame = NSRect(x: 35, y: 31, width: 355, height: 15)
+        titleLabel.frame = NSRect(x: 35, y: 31, width: 387, height: 15)
 
         statusLabel = NSTextField(labelWithString: "Idle")
         statusLabel.font = .systemFont(ofSize: 10)
         statusLabel.textColor = .tertiaryLabelColor
-        statusLabel.frame = NSRect(x: 14, y: 15, width: 376, height: 13)
+        statusLabel.frame = NSRect(x: 14, y: 15, width: 408, height: 13)
 
         let views: [NSView] = [previous, playButton, stop, next, muteButton, slower, rateLabel, faster,
-                               collapseButton, dock, close, logoView, titleLabel, statusLabel]
+                               micButton, collapseButton, dock, close, logoView, titleLabel, statusLabel]
         for view in views {
             effect.addSubview(view)
         }
-        expandedViews = [previous, stop, next, muteButton, slower, rateLabel, faster, dock, close,
+        expandedViews = [previous, stop, next, muteButton, slower, rateLabel, faster, micButton, dock, close,
                          logoView, titleLabel, statusLabel]
 
         if let saved = UserDefaults.standard.string(forKey: "overlayOrigin") {
@@ -364,6 +589,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 statusLabel.stringValue = status
             }
         }
+
+        let replying = reply.phase != .idle
+        micButton.contentTintColor = reply.phase == .recording ? .systemRed : .labelColor
+        let micLabel = reply.phase == .recording ? "Stop and send reply" : "Reply by voice"
+        micButton.toolTip = micLabel
+        micButton.setAccessibilityLabel(micLabel)
+        switch reply.phase {
+        case .recording: statusLabel.stringValue = "Listening… press again to send"
+        case .transcribing: statusLabel.stringValue = "Transcribing…"
+        default: break
+        }
+        if replying && state.state == "idle" { titleLabel.stringValue = "Reply" }
     }
 
     // Show the expected result at once; the next file read confirms it.
@@ -399,6 +636,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         act(["--mute"])
     }
 
+    @objc private func micTapped() {
+        reply.toggle()
+    }
+
     @objc private func nextTapped() {
         act(["--next"], expect: expectLoading)
     }
@@ -429,6 +670,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func closeTapped() {
         NSApp.terminate(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        try? FileManager.default.removeItem(atPath: stateFile("overlay.pid"))
     }
 }
 

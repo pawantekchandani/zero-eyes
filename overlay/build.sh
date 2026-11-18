@@ -33,6 +33,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Zero Eyes records your spoken reply after you press the reply shortcut or the mic button. The audio is transcribed on this Mac and then deleted.</string>
 </dict>
 </plist>
 PLIST

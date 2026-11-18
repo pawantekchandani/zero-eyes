@@ -25,6 +25,10 @@ APPLE_VOICE=""
 | `PITCH` | Edge pitch, `+/-NHz`. |
 | `MUTED` | Start muted. The overlay's speaker button flips this. |
 | `AUTO_READ` | Whether the OpenCode plugin starts reading on its own. |
+| `REPLY_MODEL` | Path to a whisper.cpp model for voice replies. Empty (default) uses `ggml-base.en`, downloaded on first use to `models/` in the state folder and checked by SHA-256. |
+| `REPLY_LANGUAGE` | Language code passed to `whisper-cli -l`. Default `en`. Use a multilingual model for other languages. |
+| `REPLY_SUBMIT` | `true` presses Return after the reply is pasted. Default `false`. |
+| `REPLY_SILENCE` | Seconds of silence that end a recording. Default `2`. `0` means only the shortcut or the mic button ends it. Recording always stops after 120 seconds. |
 
 Environment overrides, handy for testing:
 
@@ -52,6 +56,9 @@ Per-session speaking rules live in `~/.config/zero-eyes/hooks.json`; see
 | `paused` | Present while paused |
 | `player.pid`, `afplay.pid`, `worker.pid` | Live processes |
 | `nav` | A pending next/previous/replay request |
+| `overlay.pid` | The overlay's pid; `zero-eyes --reply` signals it |
+| `reply.wav` | A voice reply while it is recorded and transcribed; deleted after |
+| `models/` | The downloaded whisper model |
 | `queue.log` | Per-item trace, only when `EDGE_QUEUE_DEBUG` is set |
 
 History is plain text of what was read. Nothing is uploaded anywhere; delete

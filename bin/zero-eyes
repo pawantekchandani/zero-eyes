@@ -11,6 +11,7 @@ when chosen, by Microsoft Edge's Read Aloud voice service through the
     zero-eyes --now                    # one JSON line of state
     zero-eyes --stop | --pause | --mute | --next | --previous | --replay
     zero-eyes --rate-up | --rate-down
+    zero-eyes --reply                  # push-to-talk: start, then stop and send
 
 State lives in ~/Library/Application Support/Zero Eyes; configuration in
 ~/.config/zero-eyes/config. Both are per-user and private.
@@ -39,8 +40,11 @@ DEBUG_LOG = os.path.join(STATE_DIR, "queue.log")
 HISTORY_FILE = os.path.join(STATE_DIR, "history.json")
 NOW_FILE = os.path.join(STATE_DIR, "now.json")
 NAV_FILE = os.path.join(STATE_DIR, "nav")
+OVERLAY_PID_FILE = os.path.join(STATE_DIR, "overlay.pid")
+MODELS_DIR = os.path.join(STATE_DIR, "models")
 CONFIG_FILE = os.path.expanduser("~/.config/zero-eyes/config")
 OVERLAY_APP = os.path.expanduser("~/Applications/Zero Eyes Overlay.app")
+OVERLAY_BINARY = os.path.join(OVERLAY_APP, "Contents", "MacOS", "ZeroEyesOverlay")
 
 def ensure_state_dir():
     """State is per-user and private: create it mode 700 before first write."""
@@ -64,6 +68,11 @@ def load_config():
         # Empty: the best installed English voice (Premium, then Enhanced,
         # then the system voice). Any `say -v` name or voice identifier.
         "APPLE_VOICE": "",
+        # Push-to-talk reply (zero-eyes --reply); see docs/configuration.md.
+        "REPLY_MODEL": "",
+        "REPLY_LANGUAGE": "en",
+        "REPLY_SUBMIT": "false",
+        "REPLY_SILENCE": "2",
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -83,7 +92,22 @@ def load_config():
         cfg["ENGINE"] = os.environ["ZERO_EYES_ENGINE"]
     return cfg
 
+SAVED_KEYS = ("VOICE", "RATE", "VOLUME", "PITCH", "AUTO_READ", "MUTED", "ENGINE",
+              "APPLE_VOICE")
+
 def save_config(cfg):
+    # Keys this function does not write (REPLY_*, ...) are kept as they were,
+    # so a mute or speed change never erases the user's other settings.
+    kept = []
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            for line in f:
+                line = line.strip()
+                if (line and not line.startswith("#") and "=" in line
+                        and line.split("=", 1)[0].strip() not in SAVED_KEYS):
+                    kept.append(line)
+    except OSError:
+        pass
     lines = [
         "# Zero Eyes configuration — see docs/configuration.md",
         f'VOICE="{cfg.get("VOICE", "en-IN-PrabhatNeural")}"',
@@ -94,7 +118,7 @@ def save_config(cfg):
         f'MUTED="{cfg.get("MUTED", "false")}"',
         f'ENGINE="{cfg.get("ENGINE", "apple")}"',
         f'APPLE_VOICE="{cfg.get("APPLE_VOICE", "")}"',
-    ]
+    ] + kept
     os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
     with open(CONFIG_FILE, "w") as f:
         f.write("\n".join(lines) + "\n")
@@ -533,6 +557,177 @@ def cancel():
         pass
     clear_now()
 
+# Push-to-talk reply.
+#
+# The overlay owns the microphone and the paste, so macOS asks for Microphone
+# and Accessibility once, for "Zero Eyes Overlay", instead of for whichever
+# runner happens to call the player. The player only toggles the overlay
+# (SIGUSR1) and does the parts that are easier in Python: checks, spoken
+# notices, the model download and the Whisper call.
+
+WHISPER_MODEL_NAME = "ggml-base.en.bin"
+WHISPER_MODEL_URL = ("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/"
+                     + WHISPER_MODEL_NAME)
+WHISPER_MODEL_SHA256 = "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002"
+WHISPER_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
+def is_true(value) -> bool:
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+def reply_settings(cfg):
+    """Reply settings from the config, with bad values replaced by defaults."""
+    model = os.path.expanduser(cfg.get("REPLY_MODEL", "").strip())
+    try:
+        silence = max(0.0, float(cfg.get("REPLY_SILENCE", "2")))
+    except ValueError:
+        silence = 2.0
+    return {
+        "model": model or os.path.join(MODELS_DIR, WHISPER_MODEL_NAME),
+        "default_model": not model,
+        "language": cfg.get("REPLY_LANGUAGE", "").strip() or "en",
+        "submit": is_true(cfg.get("REPLY_SUBMIT", "false")),
+        "silence": silence,
+    }
+
+def find_whisper():
+    """Path of whisper.cpp's whisper-cli, or None. The overlay and the Services
+    run with a minimal PATH, so Homebrew's folders are searched as well."""
+    import shutil
+    path = os.pathsep.join([os.environ.get("PATH", ""), *WHISPER_DIRS])
+    return shutil.which("whisper-cli", path=path)
+
+def whisper_command(whisper, model, wav, language):
+    return [whisper, "-m", model, "-f", wav, "-l", language, "-nt", "-np"]
+
+def clean_transcript(output: str) -> str:
+    """whisper-cli text without its non-speech markers: [BLANK_AUDIO], (music),
+    *sighs* and the like. Speech alone is left, on one line."""
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)|\*[^*]*\*", " ", output)
+    return re.sub(r"\s+", " ", text).strip()
+
+def speak_notice(text):
+    """A short spoken message from Zero Eyes itself."""
+    os.environ["ZERO_EYES_ORIGIN"] = "Zero Eyes"
+    cfg = load_config()
+    ensure_overlay()
+    enqueue(text, cfg["VOICE"])
+    ensure_worker()
+
+def overlay_pid():
+    try:
+        with open(OVERLAY_PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+def reply_toggle():
+    """`--reply`: ask the overlay to start recording, or to stop and send."""
+    pid = overlay_pid()
+    if not pid:
+        if not os.path.isdir(OVERLAY_APP):
+            speak_notice("Reply needs the Zero Eyes overlay. Run the installer.")
+            return 1
+        ensure_overlay()
+        for _ in range(50):
+            time.sleep(0.1)
+            pid = overlay_pid()
+            if pid:
+                break
+        if not pid:
+            speak_notice("The Zero Eyes overlay did not start.")
+            return 1
+    os.kill(pid, signal.SIGUSR1)
+    return 0
+
+def reply_begin():
+    """`--reply-begin`, run by the overlay before it opens the microphone.
+
+    Stops speech, so the microphone does not record the voice, and checks that
+    a reply can be transcribed. Prints the overlay's settings as JSON; exits 1
+    after saying what is missing."""
+    cfg = reply_settings(load_config())
+    if not find_whisper():
+        speak_notice("Reply needs whisper. Install it with: brew install whisper cpp.")
+        return 1
+    if not os.path.exists(cfg["model"]) and not cfg["default_model"]:
+        speak_notice("The reply model in your config was not found.")
+        return 1
+    cancel()
+    if not os.path.exists(cfg["model"]):
+        # Fetch the model while the user talks; --reply-transcribe waits for it.
+        subprocess.Popen(
+            [sys.executable, os.path.realpath(__file__), "--reply-model"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+        )
+    print(json.dumps({"silence": cfg["silence"]}))
+    return 0
+
+def fetch_model():
+    """Download the default model once, checked against its SHA-256. A lock
+    makes a second caller wait for the first download instead of repeating it."""
+    import hashlib
+    model = os.path.join(MODELS_DIR, WHISPER_MODEL_NAME)
+    os.makedirs(MODELS_DIR, mode=0o700, exist_ok=True)
+    with open(model + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.path.exists(model):
+            return True
+        part = model + ".part"
+        try:
+            subprocess.run(["/usr/bin/curl", "-fsSL", "--retry", "2", "-o", part,
+                            WHISPER_MODEL_URL], check=True, timeout=900)
+            digest = hashlib.sha256()
+            with open(part, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    digest.update(block)
+            if digest.hexdigest() != WHISPER_MODEL_SHA256:
+                raise ValueError("model checksum mismatch")
+            os.replace(part, model)
+            return True
+        except Exception:
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+            return False
+
+def reply_transcribe(wav):
+    """`--reply-transcribe FILE`, run by the overlay after recording.
+
+    Prints {"text", "submit"} as JSON for the overlay to paste. The recording
+    is deleted afterwards. Empty text means nothing to paste; the reason has
+    already been spoken."""
+    cfg = reply_settings(load_config())
+    text = ""
+    try:
+        whisper = find_whisper()
+        if not whisper:
+            speak_notice("Reply needs whisper. Install it with: brew install whisper cpp.")
+        elif not os.path.exists(cfg["model"]) and not (cfg["default_model"] and fetch_model()):
+            speak_notice("The speech model could not be downloaded.")
+        else:
+            result = subprocess.run(
+                whisper_command(whisper, cfg["model"], wav, cfg["language"]),
+                capture_output=True, text=True, timeout=300,
+            )
+            text = clean_transcript(result.stdout) if result.returncode == 0 else ""
+            if result.returncode != 0:
+                speak_notice("Transcription failed.")
+            elif not text:
+                speak_notice("I did not catch that.")
+    except Exception:
+        speak_notice("Transcription failed.")
+    finally:
+        try:
+            os.remove(wav)
+        except OSError:
+            pass
+    print(json.dumps({"text": text, "submit": cfg["submit"]}))
+    return 0
+
 def ensure_worker():
     """Start a queue player if none is running. The lock inside drain() makes
     this safe: losers of the race exit immediately."""
@@ -562,7 +757,7 @@ def ensure_overlay():
         return
     try:
         running = subprocess.run(
-            ["/usr/bin/pgrep", "-f", "ReadAloudOverlay"],
+            ["/usr/bin/pgrep", "-f", OVERLAY_BINARY],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -574,7 +769,7 @@ def ensure_overlay():
         return
     try:
         subprocess.Popen(
-            [os.path.join(OVERLAY_APP, "Contents", "MacOS", "ReadAloudOverlay")],
+            [OVERLAY_BINARY],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1166,6 +1361,19 @@ def main():
     if "--rate-down" in args:
         print(adjust_rate(-10))
         sys.exit(0)
+
+    if "--reply" in args:
+        sys.exit(reply_toggle())
+
+    if "--reply-begin" in args:
+        sys.exit(reply_begin())
+
+    if "--reply-transcribe" in args:
+        files = [a for a in args if not a.startswith("--")]
+        sys.exit(reply_transcribe(files[0]) if files else 2)
+
+    if "--reply-model" in args:
+        sys.exit(0 if fetch_model() else 1)
 
     if "--toggle-auto" in args:
         cfg = load_config()
