@@ -18,6 +18,7 @@ APPLE_VOICE=""
 | Key | Meaning |
 | --- | --- |
 | `ENGINE` | `apple` (the Mac's own voices; `auto` and unknown values mean the same), `edge` (Edge voices only), or `say` (`say` speaks directly, without the cache). |
+| `PIPER_MODEL` | Linux only. Path to a piper voice model (`.onnx`). When it is set and `piper` is on PATH, piper speaks; otherwise espeak-ng (or espeak) speaks. |
 | `APPLE_VOICE` | Apple voice, as a `say -v` name or a voice identifier. Empty picks the best installed English voice: Premium, then Enhanced, then the system voice. Devanagari text goes to an installed Hindi voice (such as Lekha) when there is one. |
 | `VOICE` | Edge Read Aloud voice. `edge-tts --list-voices` lists them; Devanagari text switches to `hi-IN-MadhurNeural` on its own. |
 | `RATE` | Rate, `+/-N%`, for every engine; for Apple voices `+0%` is 175 words per minute. `-` and `+` in the overlay move it in 10% steps. |
@@ -41,12 +42,23 @@ Environment overrides, handy for testing:
 | `ZERO_EYES_ORIGIN` | The app name the overlay shows |
 | `ZERO_EYES_OVERLAY_APP` | Where `overlay/build.sh` writes the app bundle |
 
+On Linux the installer writes `ENGINE="auto"`. The values map like this:
+
+| `ENGINE` | Linux engine |
+| --- | --- |
+| `auto`, `apple`, `piper`, `say`, unknown | piper when `PIPER_MODEL` and `piper` are both there, else espeak-ng |
+| `espeak` | espeak-ng (or espeak) |
+| `edge` | Edge voices; needs `edge-tts` and `ffplay` or `mpv` |
+
+`RATE` maps to piper `--length_scale` and to espeak `-s` (`+0%` is 175 words per minute). Devanagari text uses the espeak `hi` voice.
+
 Per-session speaking rules live in `~/.config/zero-eyes/hooks.json`; see
 [apps.md](apps.md).
 
 ## State
 
-`~/Library/Application Support/Zero Eyes` (mode 700):
+`~/Library/Application Support/Zero Eyes` on macOS, and `$XDG_STATE_HOME/zero-eyes`
+(default `~/.local/state/zero-eyes`) on Linux, mode 700:
 
 | File | Holds |
 | --- | --- |
@@ -68,7 +80,9 @@ History is plain text of what was read. Nothing is uploaded anywhere; delete
 
 Speech is synthesized part by part to cached files in `cache/` — AAC (`.m4a`)
 made by `say -o` for Apple voices, MP3 for Edge — and played by `/usr/bin/afplay`.
-With `ENGINE="say"`, `/usr/bin/say` reads the text directly. Pause and resume are
+With `ENGINE="say"`, `/usr/bin/say` reads the text directly. On Linux, piper and
+espeak-ng make WAV parts, played by the first of `paplay`, `pw-play`, `ffplay`, `mpv`
+and `aplay` found on PATH; Edge MP3 parts need `ffplay` or `mpv`. Pause and resume are
 signals to the playing process, so they are instant.
 
 The Edge voices come from Microsoft Edge's Read Aloud endpoint through

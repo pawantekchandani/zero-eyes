@@ -14,7 +14,8 @@ import { Plugin } from "@opencode/plugin"
  *   macOS   -> ~/.local/bin/zero-eyes (the Zero Eyes player: Edge TTS voices,
  *              fallback to say; voice and rate in ~/.config/zero-eyes/config)
  *              when present, else say
- *   Linux   -> spd-say
+ *   Linux   -> ~/.local/bin/zero-eyes when present (piper or espeak-ng),
+ *              else spd-say
  *   Windows -> PowerShell + System.Speech
  *
  * Commands:
@@ -26,7 +27,7 @@ import { Plugin } from "@opencode/plugin"
  *
  * The desktop GUI binds Ctrl+Shift+R to the same start/stop toggle.
  *
- * On macOS the shared player keeps a capped queue: a new answer waits behind
+ * On macOS and Linux the shared player keeps a capped queue: a new answer waits behind
  * whatever is speaking, and only the newest three may wait, so answers do not
  * go stale. /zero-eyes-stop clears the queue for every app using that player,
  * not just this one.
@@ -151,8 +152,10 @@ function listText(answers: readonly Answer[]): string {
 const PLAYER = join(homedir(), ".local/bin/zero-eyes")
 
 function zeroEyes(): string | null {
-  // The player is macOS-only (Edge TTS or say, plus afplay), so never elsewhere.
-  return process.platform === "darwin" && existsSync(PLAYER) ? PLAYER : null
+  // The player runs on macOS and Linux only, so never elsewhere.
+  return (process.platform === "darwin" || process.platform === "linux") && existsSync(PLAYER)
+    ? PLAYER
+    : null
 }
 
 function speak(text: string, options: Options): boolean {

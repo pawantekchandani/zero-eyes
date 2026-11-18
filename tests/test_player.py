@@ -62,19 +62,102 @@ class SplitChunksTests(unittest.TestCase):
 class EngineTests(unittest.TestCase):
     def test_named_engines_are_kept(self):
         for engine in ("apple", "edge", "say"):
-            self.assertEqual(ze.resolve_engine(engine), engine)
-        self.assertEqual(ze.resolve_engine(" Edge "), "edge")
+            self.assertEqual(ze.resolve_engine(engine, "darwin"), engine)
+        self.assertEqual(ze.resolve_engine(" Edge ", "darwin"), "edge")
 
     def test_auto_empty_and_unknown_mean_apple(self):
-        for value in ("auto", "", None, "bogus"):
-            self.assertEqual(ze.resolve_engine(value), "apple")
+        for value in ("auto", "", None, "bogus", "piper", "espeak"):
+            self.assertEqual(ze.resolve_engine(value, "darwin", piper_ready=True), "apple")
 
     def test_default_engine_is_apple(self):
         with mock.patch.object(ze, "CONFIG_FILE", os.path.join(_STATE, "no-config")), \
+             mock.patch.object(ze, "IS_MAC", True), \
              mock.patch.dict(os.environ, {"ZERO_EYES_ENGINE": ""}):
             cfg = ze.load_config()
         self.assertEqual(cfg["ENGINE"], "apple")
         self.assertEqual(cfg["APPLE_VOICE"], "")
+
+
+class LinuxEngineTests(unittest.TestCase):
+    def test_local_engine_is_piper_when_ready(self):
+        for value in ("auto", "", None, "apple", "say", "bogus", "piper"):
+            self.assertEqual(ze.resolve_engine(value, "linux", piper_ready=True), "piper")
+
+    def test_local_engine_is_espeak_without_piper(self):
+        for value in ("auto", "apple", "piper", "espeak"):
+            self.assertEqual(ze.resolve_engine(value, "linux", piper_ready=False), "espeak")
+
+    def test_named_engines_are_kept(self):
+        self.assertEqual(ze.resolve_engine("Edge", "linux", piper_ready=True), "edge")
+        self.assertEqual(ze.resolve_engine("espeak", "linux", piper_ready=True), "espeak")
+
+    def test_default_engine_is_auto(self):
+        with mock.patch.object(ze, "CONFIG_FILE", os.path.join(_STATE, "no-config")), \
+             mock.patch.object(ze, "IS_MAC", False), \
+             mock.patch.dict(os.environ, {"ZERO_EYES_ENGINE": ""}):
+            cfg = ze.load_config()
+        self.assertEqual(cfg["ENGINE"], "auto")
+        self.assertEqual(cfg["PIPER_MODEL"], "")
+
+    def test_piper_ready_needs_binary_and_model(self):
+        model = os.path.join(_STATE, "voice.onnx")
+        open(model, "w").close()
+        self.assertTrue(ze.piper_ready(model, which=lambda n: "/usr/bin/piper"))
+        self.assertFalse(ze.piper_ready(model, which=lambda n: None))
+        self.assertFalse(ze.piper_ready(model + ".missing", which=lambda n: "/usr/bin/piper"))
+        self.assertFalse(ze.piper_ready("", which=lambda n: "/usr/bin/piper"))
+
+    def test_piper_model_survives_save(self):
+        path = os.path.join(_STATE, "config-save")
+        with open(path, "w") as f:
+            f.write('PIPER_MODEL="~/voices/en.onnx"\n')
+        with mock.patch.object(ze, "CONFIG_FILE", path):
+            ze.save_config({"RATE": "+10%"})
+            self.assertEqual(ze.load_config()["PIPER_MODEL"], "~/voices/en.onnx")
+
+
+class StateDirTests(unittest.TestCase):
+    def test_macos(self):
+        self.assertEqual(ze.default_state_dir("darwin", {}),
+                         os.path.expanduser("~/Library/Application Support/Zero Eyes"))
+
+    def test_linux_xdg(self):
+        self.assertEqual(ze.default_state_dir("linux", {"XDG_STATE_HOME": "/x/state"}),
+                         "/x/state/zero-eyes")
+
+    def test_linux_default_and_relative_xdg(self):
+        expected = os.path.expanduser("~/.local/state/zero-eyes")
+        self.assertEqual(ze.default_state_dir("linux", {}), expected)
+        self.assertEqual(ze.default_state_dir("linux", {"XDG_STATE_HOME": "rel"}), expected)
+
+
+class AudioPlayerTests(unittest.TestCase):
+    @staticmethod
+    def which_of(*names):
+        return lambda n: f"/usr/bin/{n}" if n in names else None
+
+    def test_macos_is_afplay(self):
+        self.assertEqual(ze.audio_player("m4a", "darwin", self.which_of()), ["/usr/bin/afplay"])
+
+    def test_wav_order(self):
+        all_players = ("paplay", "pw-play", "ffplay", "mpv", "aplay")
+        self.assertEqual(ze.audio_player("wav", "linux", self.which_of(*all_players)),
+                         ["/usr/bin/paplay"])
+        self.assertEqual(ze.audio_player("wav", "linux", self.which_of(*all_players[1:])),
+                         ["/usr/bin/pw-play"])
+        self.assertEqual(ze.audio_player("wav", "linux", self.which_of("ffplay", "aplay")),
+                         ["/usr/bin/ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"])
+        self.assertEqual(ze.audio_player("wav", "linux", self.which_of("mpv", "aplay")),
+                         ["/usr/bin/mpv", "--no-video", "--really-quiet"])
+        self.assertEqual(ze.audio_player("wav", "linux", self.which_of("aplay")),
+                         ["/usr/bin/aplay", "-q"])
+        self.assertIsNone(ze.audio_player("wav", "linux", self.which_of()))
+
+    def test_mp3_needs_ffplay_or_mpv(self):
+        self.assertIsNone(ze.audio_player("mp3", "linux",
+                                          self.which_of("paplay", "pw-play", "aplay")))
+        self.assertEqual(ze.audio_player("mp3", "linux", self.which_of("paplay", "mpv")),
+                         ["/usr/bin/mpv", "--no-video", "--really-quiet"])
 
 
 class RateTests(unittest.TestCase):
@@ -92,6 +175,26 @@ class RateTests(unittest.TestCase):
              "--file-format=m4af", "--data-format=aac", "-o", "/tmp/x"])
         self.assertEqual(ze.apple_synth_args("", "odd", "/tmp/x"),
                          ["/usr/bin/say", "--file-format=m4af", "--data-format=aac", "-o", "/tmp/x"])
+
+    def test_rate_to_length_scale(self):
+        self.assertEqual(ze.rate_to_length_scale("+0%"), 1.0)
+        self.assertEqual(ze.rate_to_length_scale("+25%"), 0.8)
+        self.assertEqual(ze.rate_to_length_scale("-50%"), 2.0)
+        self.assertEqual(ze.rate_to_length_scale("+300%"), 0.4)  # clamped at 2.5x
+        self.assertIsNone(ze.rate_to_length_scale("fast"))
+
+    def test_piper_synth_args(self):
+        self.assertEqual(ze.piper_synth_args("/m/en.onnx", "+25%", "/tmp/x.wav"),
+                         ["piper", "--model", "/m/en.onnx", "--length_scale", "0.8",
+                          "--output_file", "/tmp/x.wav"])
+        self.assertEqual(ze.piper_synth_args("/m/en.onnx", "odd", "/tmp/x.wav"),
+                         ["piper", "--model", "/m/en.onnx", "--output_file", "/tmp/x.wav"])
+
+    def test_espeak_synth_args(self):
+        self.assertEqual(ze.espeak_synth_args("/usr/bin/espeak-ng", "", "+20%", "/tmp/x.wav"),
+                         ["/usr/bin/espeak-ng", "-s", "210", "-w", "/tmp/x.wav", "--stdin"])
+        self.assertEqual(ze.espeak_synth_args("espeak", "hi", "-50%", "/tmp/x.wav"),
+                         ["espeak", "-v", "hi", "-s", "90", "-w", "/tmp/x.wav", "--stdin"])
 
     def test_say_args_unchanged(self):
         self.assertEqual(ze.say_args("hi", "+0%"), ["/usr/bin/say", "-r", "175", "hi"])

@@ -74,6 +74,19 @@ Test it:
 printf '%s' "Zero Eyes is installed." | ~/.local/bin/zero-eyes
 ```
 
+## Linux
+
+The player, the Claude Code hook and the OpenCode plugin also work on Linux. The overlay, the Services, the login agent and voice replies are macOS only.
+
+Requirements: `python3`, `espeak-ng` (or [`piper`](https://github.com/rhasspy/piper) with a voice model set in `PIPER_MODEL`), and an audio player: `paplay`, `pw-play`, `ffplay`, `mpv` or `aplay`. Edge voices make MP3, so they also need `ffplay` or `mpv`.
+
+```sh
+sudo apt install espeak-ng pulseaudio-utils   # Debian / Ubuntu
+scripts/install-linux.sh
+```
+
+`scripts/install-linux.sh --check` shows what is missing. `scripts/install-linux.sh --uninstall` removes it; add `--purge` to also delete the config and state. Control playback with `zero-eyes --pause`, `--stop`, `--next` and `--prev`, for example from desktop shortcuts.
+
 ## Use
 
 The overlay appears with the first thing spoken and can be dragged anywhere; it remembers its place and whether it was collapsed.
