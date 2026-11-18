@@ -7,6 +7,12 @@
 Reads your AI coding agent's answers aloud on macOS, so you can look away from the screen and still follow the work.
 
 <p align="center">
+  <a href="docs/overview.mp4"><img src="docs/overview-poster.png" width="800" alt="Zero Eyes overview video, 1 minute 34 seconds, with voiceover"></a>
+</p>
+
+<p align="center"><a href="docs/overview.mp4">Watch the overview video (1:34, with sound)</a></p>
+
+<p align="center">
   <img src="docs/demo.gif" width="800" alt="Three Claude Code answers go into one Zero Eyes queue. The floating bar pauses, plays, skips to the next answer and goes back to the previous one">
 </p>
 
