@@ -37,7 +37,7 @@ voices take over. Set `ENGINE="edge" | "say" | "auto"` in the config to choose.
 ## Install
 
 ```sh
-git clone https://github.com/<you>/zero-eyes.git
+git clone https://github.com/pawantekchandani/zero-eyes.git
 cd zero-eyes
 scripts/install.sh
 ```
