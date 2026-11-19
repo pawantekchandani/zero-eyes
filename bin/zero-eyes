@@ -11,6 +11,7 @@ when chosen, by Microsoft Edge's Read Aloud voice service through the
     zero-eyes --now                    # one JSON line of state
     zero-eyes --stop | --pause | --mute | --next | --previous | --replay
     zero-eyes --rate-up | --rate-down
+    zero-eyes --seek N                 # jump to part N (0-based) of this answer
     zero-eyes --reply                  # push-to-talk: start, then stop and send
 
 On Linux the player alone runs (no overlay, no Services): speech comes from
@@ -59,6 +60,8 @@ DEBUG_LOG = os.path.join(STATE_DIR, "queue.log")
 HISTORY_FILE = os.path.join(STATE_DIR, "history.json")
 NOW_FILE = os.path.join(STATE_DIR, "now.json")
 NAV_FILE = os.path.join(STATE_DIR, "nav")
+PART_FILE = os.path.join(STATE_DIR, "part.json")
+SEEK_FILE = os.path.join(STATE_DIR, "seek")
 OVERLAY_PID_FILE = os.path.join(STATE_DIR, "overlay.pid")
 MODELS_DIR = os.path.join(STATE_DIR, "models")
 CONFIG_FILE = os.path.expanduser("~/.config/zero-eyes/config")
@@ -476,10 +479,51 @@ def write_now(item, index, total):
     os.replace(tmp, NOW_FILE)
 
 def clear_now():
+    for path in (NOW_FILE, PART_FILE, SEEK_FILE):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+def write_part(part, parts):
+    tmp = PART_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"part": part, "parts": parts}, f)
+    os.replace(tmp, PART_FILE)
+
+def read_part():
     try:
-        os.remove(NOW_FILE)
-    except OSError:
-        pass
+        with open(PART_FILE, "r") as f:
+            data = json.load(f)
+        return int(data.get("part", 0)), int(data.get("parts", 0))
+    except Exception:
+        return 0, 0
+
+def take_seek():
+    try:
+        with open(SEEK_FILE, "r") as f:
+            target = int(f.read().strip())
+        os.remove(SEEK_FILE)
+    except Exception:
+        return None
+    return target
+
+def seek(part):
+    """Jump to one part (sentence group) of the answer that is playing. The
+    playing part is killed; the player starts again at `part`. A paused
+    answer stays paused at the new part."""
+    _, parts = read_part()
+    if parts <= 0:
+        return False
+    with open(SEEK_FILE, "w") as f:
+        f.write(str(max(0, min(parts - 1, part))))
+    afplay = is_playing()
+    if afplay:
+        try:
+            os.kill(afplay, signal.SIGKILL)
+        except Exception:
+            pass
+    return True
 
 def set_nav(direction):
     with open(NAV_FILE, "w") as f:
@@ -537,6 +581,7 @@ def now_state():
         state = "playing"
     else:
         state = "idle"
+    part, parts = read_part()
     return {
         "state": state,
         "text": now.get("text", ""),
@@ -547,6 +592,8 @@ def now_state():
         "rate": cfg.get("RATE", "+0%"),
         "voice": cfg.get("VOICE", ""),
         "muted": is_muted(),
+        "part": part,
+        "parts": parts,
     }
 
 def cancel():
@@ -1371,12 +1418,13 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
         while i < total:
             r = live_rate()
             prod["rate"] = r
+            prod["i"] = i
             if await fetch(i, r) is None:
                 return
             i += 1
         prune_cache()
 
-    prod = {"rate": None}
+    prod = {"rate": None, "i": 0}
 
     async def prefetch_next():
         # Once this answer is fetched, fetch the first part of the next waiting
@@ -1425,18 +1473,30 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
 
     try:
         index = 0
+        try:
+            os.remove(SEEK_FILE)  # a seek meant for the answer before this one
+        except OSError:
+            pass
         while index < total:
+            target = take_seek()
+            if target is not None:
+                index = max(0, min(total - 1, target))
+            write_part(index, total)
             # Hold here while paused between parts.
-            while os.path.exists(PAUSED_FLAG):
+            while os.path.exists(PAUSED_FLAG) and not os.path.exists(SEEK_FILE):
                 if _should_abort():
                     return
                 await asyncio.sleep(0.05)
             if _should_abort():
                 return
+            if os.path.exists(SEEK_FILE):
+                continue  # a seek while paused: move there and stay paused
             r = live_rate()
             path = part_path(index, r)
             if not (os.path.exists(path) and os.path.getsize(path) > 0):
-                if producer.done() or prod["rate"] != r:
+                # Fetch it here when the producer is not about to: it is done,
+                # on another rate, or behind a seek that jumped ahead of it.
+                if producer.done() or prod["rate"] != r or index > prod["i"]:
                     path = await fetch(index, r)
                     if path is None:
                         if index == 0 and engine == "apple":
@@ -1447,6 +1507,8 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                     while not (os.path.exists(path) and os.path.getsize(path) > 0):
                         if _should_abort():
                             return
+                        if os.path.exists(SEEK_FILE):
+                            break
                         if producer.done() or prod["rate"] != r:
                             path = await fetch(index, r)
                             if path is None:
@@ -1455,12 +1517,18 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                                 return
                             break
                         await asyncio.sleep(0.05)
+            # A seek or pause that came while this part was being made: go back
+            # to the loop top, which moves to the new part or holds.
+            if os.path.exists(SEEK_FILE) or os.path.exists(PAUSED_FLAG):
+                continue
             proc = await asyncio.create_subprocess_exec(*player, path, **player_io)
             current["proc"] = proc
             with open(AFPLAY_PID_FILE, "w") as f:
                 f.write(str(proc.pid))
             await proc.wait()
             current["proc"] = None
+            if os.path.exists(SEEK_FILE) and not _should_abort():
+                continue  # killed by a seek: the loop top moves to the new part
             if proc.returncode != 0 or _should_abort():
                 return  # killed by Next / Previous / Stop / Mute
             index += 1
@@ -1513,6 +1581,15 @@ def main():
     if "--replay" in args:
         navigate("replay")
         sys.exit(0)
+
+    if "--seek" in args:
+        position = args.index("--seek") + 1
+        try:
+            part = int(args[position])
+        except (IndexError, ValueError):
+            print("zero-eyes: --seek needs a part number", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(0 if seek(part) else 1)
 
     if "--rate-up" in args:
         print(adjust_rate(10))
