@@ -51,7 +51,7 @@ candidates+=("")
 
 built=0
 for sdk in "${candidates[@]}"; do
-  args=(-O -swift-version 5)
+  args=(-O -swift-version 5 -target "$(uname -m)-apple-macos13.0")
   [[ -n "$sdk" ]] && args+=(-sdk "$sdk")
   if swiftc "${args[@]}" "$SRC" -o "$BINARY" 2>/dev/null; then
     built=1
