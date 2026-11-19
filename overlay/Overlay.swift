@@ -25,6 +25,8 @@ struct PlayerState {
     var queue = 0
     var rate = "+0%"
     var muted = false
+    var part = 0
+    var parts = 0
 
     static func read() -> PlayerState {
         var result = PlayerState()
@@ -47,6 +49,14 @@ struct PlayerState {
             result.origin = object["origin"] as? String ?? ""
             result.index = object["index"] as? Int ?? 0
             result.total = object["total"] as? Int ?? 0
+        }
+
+        // Which part (sentence group) of the answer is playing, for the slider.
+        if result.state != "idle",
+           let data = fm.contents(atPath: stateFile("part.json")),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            result.part = object["part"] as? Int ?? 0
+            result.parts = object["parts"] as? Int ?? 0
         }
 
         let config = ("~/.config/zero-eyes/config" as NSString).expandingTildeInPath
@@ -294,6 +304,17 @@ final class OverlayPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+// A slider that knows when the user holds it, so the half-second refresh does
+// not pull the knob back while it is being dragged.
+final class SeekSlider: NSSlider {
+    private(set) var dragging = false
+    override func mouseDown(with event: NSEvent) {
+        dragging = true
+        super.mouseDown(with: event)  // returns when the mouse is released
+        dragging = false
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: OverlayPanel!
     private var effectView: NSVisualEffectView!
@@ -307,16 +328,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var titleLabel: NSTextField!
     private var statusLabel: NSTextField!
     private var rateLabel: NSTextField!
+    private var seekSlider: SeekSlider!
     private var timer: Timer?
     private var latest = PlayerState()
     private var moveObserver: NSObjectProtocol?
     private var expandedViews: [NSView] = []
     private var collapsed = UserDefaults.standard.bool(forKey: "overlayCollapsed")
 
-    private let expandedSize = NSSize(width: 436, height: 88)
+    private let expandedSize = NSSize(width: 436, height: 106)
     private let collapsedSize = NSSize(width: 96, height: 40)
-    private let playExpandedFrame = NSRect(x: 44, y: 52, width: 28, height: 26)
-    private let collapseExpandedFrame = NSRect(x: 364, y: 52, width: 28, height: 26)
+    private let playExpandedFrame = NSRect(x: 44, y: 70, width: 28, height: 26)
+    private let collapseExpandedFrame = NSRect(x: 364, y: 70, width: 28, height: 26)
     // Top-right corner of the expanded bar; collapsing keeps it in place.
     private var expandedOrigin = NSPoint.zero
     private var layingOut = false
@@ -395,7 +417,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Fixed frames on purpose: Auto Layout inside a borderless NSPanel made
         // the window collapse to its minimum width the first time it was shown.
-        let top: CGFloat = 52
+        let top: CGFloat = 70
         let previous = makeButton("backward.end.fill", "Previous audio",
                                   #selector(previousTapped), frame: NSRect(x: 12, y: top, width: 28, height: 26))
         playButton = makeButton("play.fill", "Play or pause",
@@ -436,7 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mark = Bundle.main.path(forResource: "MarkTemplate", ofType: "png")
             .flatMap { NSImage(contentsOfFile: $0) } ?? NSApp.applicationIconImage
         mark?.isTemplate = true
-        logoView = NSImageView(frame: NSRect(x: 14, y: 29, width: 15, height: 15))
+        logoView = NSImageView(frame: NSRect(x: 14, y: 47, width: 15, height: 15))
         logoView.image = mark
         logoView.imageScaling = .scaleProportionallyUpOrDown
         logoView.setAccessibilityLabel("Zero Eyes")
@@ -446,20 +468,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.lineBreakMode = .byTruncatingTail
         titleLabel.maximumNumberOfLines = 1
-        titleLabel.frame = NSRect(x: 35, y: 31, width: 387, height: 15)
+        titleLabel.frame = NSRect(x: 35, y: 49, width: 387, height: 15)
 
         statusLabel = NSTextField(labelWithString: "Idle")
         statusLabel.font = .systemFont(ofSize: 10)
         statusLabel.textColor = .tertiaryLabelColor
-        statusLabel.frame = NSRect(x: 14, y: 15, width: 408, height: 13)
+        statusLabel.frame = NSRect(x: 14, y: 33, width: 408, height: 13)
+
+        // One step per part (one or two sentences). Dragging jumps playback
+        // to that part when the mouse is released.
+        seekSlider = SeekSlider(value: 0, minValue: 0, maxValue: 1,
+                                target: self, action: #selector(seekMoved))
+        seekSlider.frame = NSRect(x: 14, y: 10, width: 408, height: 18)
+        seekSlider.controlSize = .small
+        seekSlider.isContinuous = false
+        seekSlider.allowsTickMarkValuesOnly = true
+        seekSlider.isEnabled = false
+        seekSlider.toolTip = "Drag to jump forward or back by sentence"
+        seekSlider.setAccessibilityLabel("Position in answer")
 
         let views: [NSView] = [previous, playButton, stop, next, muteButton, slower, rateLabel, faster,
-                               micButton, collapseButton, dock, close, logoView, titleLabel, statusLabel]
+                               micButton, collapseButton, dock, close, logoView, titleLabel, statusLabel, seekSlider]
         for view in views {
             effect.addSubview(view)
         }
         expandedViews = [previous, stop, next, muteButton, slower, rateLabel, faster, micButton, dock, close,
-                         logoView, titleLabel, statusLabel]
+                         logoView, titleLabel, statusLabel, seekSlider]
 
         if let saved = UserDefaults.standard.string(forKey: "overlayOrigin") {
             let parts = saved.split(separator: ",").compactMap { Double($0) }
@@ -585,9 +619,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 var status = state.total > 0 ? "Answer \(state.index + 1) of \(state.total)" : "Playing"
                 if state.queue > 0 { status += " · \(state.queue) queued" }
+                if state.parts > 1 { status += " · part \(state.part + 1) of \(state.parts)" }
                 if state.muted { status += " · muted, not speaking" }
                 statusLabel.stringValue = status
             }
+        }
+
+        if !seekSlider.dragging {
+            let usable = state.parts > 1
+            seekSlider.isEnabled = usable
+            seekSlider.maxValue = Double(max(1, state.parts - 1))
+            seekSlider.numberOfTickMarks = usable ? state.parts : 0
+            seekSlider.integerValue = usable ? state.part : 0
         }
 
         let replying = reply.phase != .idle
@@ -646,6 +689,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func previousTapped() {
         act(["--previous"], expect: expectLoading)
+    }
+
+    @objc private func seekMoved() {
+        let target = seekSlider.integerValue
+        guard latest.parts > 1, target != latest.part else { return }
+        act(["--seek", String(target)]) { $0.part = target }
     }
 
     @objc private func slowerTapped() {
