@@ -163,7 +163,7 @@ One worker plays items in order, one at a time. Only the newest three may wait; 
 | --- | --- | --- |
 | Claude Code (CLI, desktop, T3) | Stop hook speaks `last_assistant_message` | `integrations/claude-code/` |
 | OpenCode | Plugin speaks finished answers; `/zero-eyes`, `/zero-eyes-stop` | `integrations/opencode/` |
-| Antigravity (app) | A LaunchAgent watches `~/.gemini/antigravity/conversations/` once a second and speaks each finished answer | `integrations/antigravity/` |
+| Antigravity (app) | A LaunchAgent watches `~/.gemini/antigravity/conversations/` every 3 seconds and speaks each finished answer | `integrations/antigravity/` |
 | Any app, selected text | macOS Services: `Zero Eyes Read`, `Zero Eyes Stop` | `integrations/macos-service/` |
 | Anything else | `printf '%s' "$text" \| zero-eyes` | `integrations/generic/example.sh` |
 

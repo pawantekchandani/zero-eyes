@@ -16,7 +16,7 @@ A done model reply with text and no tool call ends the turn. That text is sent
 to the player, once. Older answers are never read back: conversations that
 exist when the watcher starts are spoken only from their next answer.
 
-Load: once a second the watcher reads the modification time of each file in
+Load: every 3 seconds the watcher reads the modification time of each file in
 the folder. It opens a conversation only when its file changed, reads only the
 new rows, and leaves tool-call payloads unread.
 
@@ -35,7 +35,7 @@ import time
 PLAYER = os.path.expanduser("~/.local/bin/zero-eyes")
 CONVERSATIONS = os.path.expanduser("~/.gemini/antigravity/conversations")
 ORIGIN = "Antigravity"
-INTERVAL = 1.0
+INTERVAL = 3.0
 
 REPLY, DONE = 15, 3
 
