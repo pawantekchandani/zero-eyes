@@ -66,7 +66,7 @@ scripts/install.sh
 
 That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, and copies the three macOS Services.
 
-Install one piece at a time with `scripts/install.sh --only player|overlay|launchagent|claude-code|opencode|services`.
+Install one piece at a time with `scripts/install.sh --only player|overlay|launchagent|claude-code|opencode|antigravity|services`.
 
 See what is installed and what is missing with `scripts/install.sh --check` (or `zero-eyes-setup --check`). It changes nothing, prints the fix for each missing item, and also runs at the end of a full install.
 
@@ -163,6 +163,7 @@ One worker plays items in order, one at a time. Only the newest three may wait; 
 | --- | --- | --- |
 | Claude Code (CLI, desktop, T3) | Stop hook speaks `last_assistant_message` | `integrations/claude-code/` |
 | OpenCode | Plugin speaks finished answers; `/zero-eyes`, `/zero-eyes-stop` | `integrations/opencode/` |
+| Antigravity (app) | A LaunchAgent watches `~/.gemini/antigravity/conversations/` once a second and speaks each finished answer | `integrations/antigravity/` |
 | Any app, selected text | macOS Services: `Zero Eyes Read`, `Zero Eyes Stop` | `integrations/macos-service/` |
 | Anything else | `printf '%s' "$text" \| zero-eyes` | `integrations/generic/example.sh` |
 
