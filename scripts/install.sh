@@ -3,7 +3,8 @@
 #
 #   scripts/install.sh                 # everything it can
 #   scripts/install.sh --only player   # one part: player | overlay | launchagent
-#                                      #           claude-code | opencode | services
+#                                      #           claude-code | opencode | antigravity
+#                                      #           services
 #   scripts/install.sh --check         # report what is installed; changes nothing
 #
 # Idempotent: re-running replaces the files it owns and leaves everything else
@@ -20,6 +21,9 @@ AGENT="$HOME/Library/LaunchAgents/local.zeroeyes.overlay.plist"
 HOOK="$HOME/.claude/hooks/zero-eyes-stop.py"
 PLUGIN_DIR="$HOME/.config/opencode/plugins"
 SERVICES="$HOME/Library/Services"
+WATCHER="$BIN_DIR/zero-eyes-antigravity"
+AG_AGENT="$HOME/Library/LaunchAgents/local.zeroeyes.antigravity.plist"
+AG_LABEL="local.zeroeyes.antigravity"
 OVERLAY_ZIP_URL="https://github.com/pawantekchandani/zero-eyes/releases/latest/download/ZeroEyesOverlay.zip"
 
 AGENT_LABEL="local.zeroeyes.overlay"
@@ -179,6 +183,20 @@ install_opencode() {
   say "opencode    $PLUGIN_DIR/zero-eyes -> $ROOT/integrations/opencode"
 }
 
+install_antigravity() {
+  if [[ ! -d "$HOME/.gemini/antigravity" ]]; then
+    say "antigravity skipped — ~/.gemini/antigravity not found"
+    return
+  fi
+  mkdir -p "$BIN_DIR" "$(dirname "$AG_AGENT")"
+  install -m 0755 "$ROOT/integrations/antigravity/zero-eyes-antigravity.py" "$WATCHER"
+  sed "s|__WATCHER__|$WATCHER|" \
+    "$ROOT/integrations/antigravity/local.zeroeyes.antigravity.plist" > "$AG_AGENT"
+  launchctl bootout "gui/$(id -u)/$AG_LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$AG_AGENT" >/dev/null 2>&1 || true
+  say "antigravity $WATCHER (LaunchAgent $AG_LABEL)"
+}
+
 install_services() {
   mkdir -p "$SERVICES"
   for workflow in "$ROOT/integrations/macos-service"/*.workflow; do
@@ -305,6 +323,13 @@ PY
     else missing opencode "$PLUGIN_DIR/zero-eyes" "$SETUP --only opencode"; fi
   fi
 
+  if [[ -d "$HOME/.gemini/antigravity" ]]; then
+    if [[ -x "$WATCHER" ]]; then ok antigravity "$WATCHER"
+    else missing antigravity "$WATCHER" "$SETUP --only antigravity"; fi
+    if launchctl print "gui/$uid/$AG_LABEL" >/dev/null 2>&1; then ok watcher "gui/$uid/$AG_LABEL"
+    else missing watcher "gui/$uid/$AG_LABEL not loaded" "$SETUP --only antigravity"; fi
+  fi
+
   for name in "Zero Eyes Read" "Zero Eyes Stop" "Zero Eyes Reply"; do
     if [[ -d "$SERVICES/$name.workflow" ]]; then
       ok service "$SERVICES/$name.workflow"
@@ -332,6 +357,7 @@ want overlay     && install_overlay
 want launchagent && install_launchagent
 want claude-code && install_claude_code
 want opencode    && install_opencode
+want antigravity && install_antigravity
 want services    && install_services
 
 echo

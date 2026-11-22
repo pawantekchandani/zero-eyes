@@ -13,6 +13,8 @@ APP="$HOME/Applications/Zero Eyes Overlay.app"
 AGENT="$HOME/Library/LaunchAgents/local.zeroeyes.overlay.plist"
 HOOK="$HOME/.claude/hooks/zero-eyes-stop.py"
 PLUGIN="$HOME/.config/opencode/plugins/zero-eyes"
+WATCHER="$HOME/.local/bin/zero-eyes-antigravity"
+AG_AGENT="$HOME/Library/LaunchAgents/local.zeroeyes.antigravity.plist"
 STATE="$HOME/Library/Application Support/Zero Eyes"
 CONFIG="$HOME/.config/zero-eyes"
 
@@ -26,6 +28,13 @@ if [[ -f "$AGENT" ]]; then
   rm -f "$AGENT"
   say "removed launchagent"
 fi
+
+if [[ -f "$AG_AGENT" ]]; then
+  launchctl bootout "gui/$(id -u)/local.zeroeyes.antigravity" >/dev/null 2>&1 || true
+  rm -f "$AG_AGENT"
+  say "removed antigravity launchagent"
+fi
+[[ -f "$WATCHER" ]] && rm -f "$WATCHER" && say "removed antigravity watcher"
 
 [[ -d "$APP" ]] && rm -rf "$APP" && say "removed overlay app"
 [[ -f "$BIN" ]] && rm -f "$BIN" && say "removed player"
