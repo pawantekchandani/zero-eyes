@@ -107,7 +107,13 @@ def last_idx(path):
 
 
 def _open(path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    # The files are in WAL mode. When Antigravity closes a conversation it
+    # removes the -wal and -shm files, and a read-only open of a WAL file
+    # without them fails. With no -wal file the .db holds every row, so read
+    # it as immutable then.
+    if os.path.exists(path + "-wal"):
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+    return sqlite3.connect(f"file:{path}?immutable=1", uri=True, timeout=2)
 
 
 def new_answers(path, after):

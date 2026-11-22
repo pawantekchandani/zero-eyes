@@ -114,6 +114,21 @@ class AntigravityTest(unittest.TestCase):
         watcher.poll()
         self.assertEqual(self.spoken, ["First answer."])
 
+    def test_closed_wal_file(self):
+        """Antigravity leaves WAL-mode files with no -wal or -shm file."""
+        watcher = ag.Watcher(self.dir, self.spoken.append)
+        path, db = self.db("wal.db")
+        db.execute("pragma journal_mode=wal")
+        self.add(db, 0, 14, 3)
+        self.add(db, 1, 15, 3, text="From a closed file.")
+        db.execute("pragma wal_checkpoint(truncate)")
+        db.close()
+        for side in ("-wal", "-shm"):
+            if os.path.exists(path + side):
+                os.remove(path + side)
+        watcher.poll()
+        self.assertEqual(self.spoken, ["From a closed file."])
+
 
 if __name__ == "__main__":
     unittest.main()
