@@ -32,6 +32,17 @@ class CleanTextTests(unittest.TestCase):
         self.assertEqual(ze.clean_text_for_speech("***"), "")
         self.assertEqual(ze.clean_text_for_speech(""), "")
 
+    def test_strips_repeated_diff_and_divider_symbols(self):
+        diff = "`README.md | 29 +++++++++++++++++++-----------`; clean working tree"
+        cleaned = ze.clean_text_for_speech(diff)
+        self.assertNotIn("+", cleaned)
+        self.assertNotIn("-", cleaned)
+        self.assertIn("README.md, 29", cleaned)
+        self.assertIn("clean working tree", cleaned)
+        # Keep meaningful 1-2 symbol tokens intact
+        self.assertEqual(ze.clean_text_for_speech("C++ at +10% with --volume"),
+                         "C++ at +10% with --volume")
+
 
 class TableTests(unittest.TestCase):
     def test_table_is_read_row_by_row(self):
