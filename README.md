@@ -138,6 +138,7 @@ a rebuild macOS may ask again.
 ## Features
 
 - **Tables are read aloud.** Each row is spoken as `Header: value, Header: value.`, between "Table." and "End of table.", instead of being skipped.
+- **Clean spoken output.** Strips markdown syntax, code blocks, git commit hashes/ranges, and repeated diff or divider symbols (`+++---`, `===`, `---`) before reading aloud.
 - **Fast start & natural Edge intonation.** Local engines split into a short 160-character first part then 250-character parts so sound starts fast; `ENGINE="edge"` groups **4 sentences per part** (smaller final chunk) to keep Microsoft Edge's modulation natural.
 - **Crisp 0.2 s gap between parts.** On macOS, a persistent `AVFoundation` audio helper (`ZeroEyesAudio`) trims leading/trailing TTS silence and plays parts back-to-back with a ~0.2 s pause instead of re-opening audio per part.
 - **Jump by sentence.** A stepped seek slider in the overlay (and `zero-eyes --seek N`) lets you jump forward or back across parts of the current answer; a paused answer stays paused at the new part.

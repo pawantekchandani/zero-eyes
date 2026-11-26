@@ -43,6 +43,17 @@ class CleanTextTests(unittest.TestCase):
         self.assertEqual(ze.clean_text_for_speech("C++ at +10% with --volume"),
                          "C++ at +10% with --volume")
 
+    def test_strips_git_commit_hashes_without_breaking_words_or_numbers(self):
+        text = "Committed (`3ffe654`) on [main 870f317], pushed 81b8151..3ffe654 (6d825d9083584ec5c238a30c29cf00a60709d8a9)."
+        cleaned = ze.clean_text_for_speech(text)
+        for h in ("3ffe654", "870f317", "81b8151", "6d825d9083584ec5c238a30c29cf00a60709d8a9"):
+            self.assertNotIn(h, cleaned)
+        self.assertIn("Committed", cleaned)
+        self.assertIn("main", cleaned)
+        # Keep pure words (only a-f), pure numbers, and 0x hex literals intact
+        self.assertEqual(ze.clean_text_for_speech("defaced 1000000 0xdeadbeef"),
+                         "defaced 1000000 0xdeadbeef")
+
 
 class TableTests(unittest.TestCase):
     def test_table_is_read_row_by_row(self):
