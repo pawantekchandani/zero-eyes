@@ -11,6 +11,7 @@ when chosen, by Microsoft Edge's Read Aloud voice service through the
     zero-eyes --now                    # one JSON line of state
     zero-eyes --stop | --pause | --mute | --next | --previous | --replay
     zero-eyes --rate-up | --rate-down
+    zero-eyes --volume N | --volume-up | --volume-down
     zero-eyes --seek N                 # jump to part N (0-based) of this answer
     zero-eyes --reply                  # push-to-talk: start, then stop and send
 
@@ -67,6 +68,10 @@ MODELS_DIR = os.path.join(STATE_DIR, "models")
 CONFIG_FILE = os.path.expanduser("~/.config/zero-eyes/config")
 OVERLAY_APP = os.path.expanduser("~/Applications/Zero Eyes Overlay.app")
 OVERLAY_BINARY = os.path.join(OVERLAY_APP, "Contents", "MacOS", "ZeroEyesOverlay")
+AUDIO_BINARY = os.path.join(OVERLAY_APP, "Contents", "MacOS", "ZeroEyesAudio")
+# ZeroEyesAudio trims leading/trailing TTS silence to ~0.05s total; sleeping
+# 0.12s + ~0.03s schedule overhead yields a ~0.20s audible gap between parts.
+PART_GAP = 0.12
 
 def ensure_state_dir():
     """State is per-user and private: create it mode 700 before first write."""
@@ -80,6 +85,7 @@ def load_config():
         "VOICE": "en-IN-PrabhatNeural",
         "RATE": "+0%",
         "VOLUME": "+0%",
+        "APP_VOLUME": "100",
         "PITCH": "+0Hz",
         "AUTO_READ": "true",
         "MUTED": "false",
@@ -112,11 +118,13 @@ def load_config():
         cfg["VOICE"] = os.environ["ZERO_EYES_VOICE"]
     if os.environ.get("ZERO_EYES_RATE"):
         cfg["RATE"] = os.environ["ZERO_EYES_RATE"]
+    if os.environ.get("ZERO_EYES_APP_VOLUME"):
+        cfg["APP_VOLUME"] = os.environ["ZERO_EYES_APP_VOLUME"]
     if os.environ.get("ZERO_EYES_ENGINE"):
         cfg["ENGINE"] = os.environ["ZERO_EYES_ENGINE"]
     return cfg
 
-SAVED_KEYS = ("VOICE", "RATE", "VOLUME", "PITCH", "AUTO_READ", "MUTED", "ENGINE",
+SAVED_KEYS = ("VOICE", "RATE", "VOLUME", "APP_VOLUME", "PITCH", "AUTO_READ", "MUTED", "ENGINE",
               "APPLE_VOICE")
 
 def save_config(cfg):
@@ -137,6 +145,7 @@ def save_config(cfg):
         f'VOICE="{cfg.get("VOICE", "en-IN-PrabhatNeural")}"',
         f'RATE="{cfg.get("RATE", "+0%")}"',
         f'VOLUME="{cfg.get("VOLUME", "+0%")}"',
+        f'APP_VOLUME="{cfg.get("APP_VOLUME", "100")}"',
         f'PITCH="{cfg.get("PITCH", "+0Hz")}"',
         f'AUTO_READ="{cfg.get("AUTO_READ", "true")}"',
         f'MUTED="{cfg.get("MUTED", "false")}"',
@@ -291,13 +300,25 @@ def stop_playback():
         except OSError:
             pass
 
+def is_audio_helper(pid: int) -> bool:
+    """True when `pid` is our persistent ZeroEyesAudio helper (uses SIGUSR1/SIGUSR2)."""
+    try:
+        comm = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "comm="],
+            capture_output=True, text=True, timeout=1,
+        ).stdout.strip()
+        return os.path.basename(comm) == os.path.basename(AUDIO_BINARY)
+    except Exception:
+        return False
+
 def toggle_pause():
-    """Pause or resume. Works while audio plays (SIGSTOP / SIGCONT on afplay)
-    and also while the next part is still being fetched: the flag alone then
-    holds the player before it starts the next part."""
+    """Pause or resume. Works while audio plays (SIGUSR1/SIGUSR2 on ZeroEyesAudio,
+    SIGSTOP/SIGCONT on afplay/Linux players) and also while the next part is still
+    being fetched: the flag alone then holds the player before it starts."""
     afplay_pid = is_playing()
     if not afplay_pid and not worker_alive():
         return False
+    helper = bool(afplay_pid and is_audio_helper(afplay_pid))
     if os.path.exists(PAUSED_FLAG):
         try:
             os.remove(PAUSED_FLAG)
@@ -305,7 +326,7 @@ def toggle_pause():
             pass
         if afplay_pid:
             try:
-                os.kill(afplay_pid, signal.SIGCONT)
+                os.kill(afplay_pid, signal.SIGUSR2 if helper else signal.SIGCONT)
             except Exception:
                 pass
         return True
@@ -313,7 +334,7 @@ def toggle_pause():
         f.write("1")
     if afplay_pid:
         try:
-            os.kill(afplay_pid, signal.SIGSTOP)
+            os.kill(afplay_pid, signal.SIGUSR1 if helper else signal.SIGSTOP)
         except Exception:
             pass
     return True
@@ -566,6 +587,31 @@ def adjust_rate(delta):
     save_config(cfg)
     return cfg["RATE"]
 
+def app_volume_percent(value) -> int:
+    """Per-app playback volume percentage clamped to 0..100 (100 is full)."""
+    raw = str(value or "").strip().rstrip("%")
+    try:
+        parsed = int(float(raw))
+    except ValueError:
+        return 100
+    return max(0, min(100, parsed))
+
+def app_volume_scale(percent: int) -> float:
+    """Convert 0..100 perceptual volume to a 0.0..1.0 linear amplitude scale."""
+    clamped = max(0, min(100, int(percent)))
+    return round((clamped / 100.0) ** 2, 4)
+
+def adjust_volume(delta=None, target=None):
+    """Set or step the per-app playback volume (0..100%), without altering system volume."""
+    cfg = load_config()
+    if target is not None:
+        value = app_volume_percent(target)
+    else:
+        value = max(0, min(100, app_volume_percent(cfg.get("APP_VOLUME", "100")) + int(delta or 0)))
+    cfg["APP_VOLUME"] = str(value)
+    save_config(cfg)
+    return f"{value}%"
+
 def now_state():
     """One JSON line for the overlay: what is playing and how to draw it."""
     cfg = load_config()
@@ -590,6 +636,7 @@ def now_state():
         "total": now.get("total", len(history["items"])),
         "queue": queue_size(),
         "rate": cfg.get("RATE", "+0%"),
+        "volume": app_volume_percent(cfg.get("APP_VOLUME", "100")),
         "voice": cfg.get("VOICE", ""),
         "muted": is_muted(),
         "part": part,
@@ -849,15 +896,25 @@ def ensure_overlay():
     except Exception:
         pass
 
+def speech_text_with_origin(text: str, origin: str = "") -> str:
+    """Prefix spoken audio with the owning app name so the listener knows its source."""
+    name = (origin or "").strip().rstrip(".!?")
+    if not name or name in ("Read aloud", "Zero Eyes"):
+        return text
+    if text.lower().startswith(name.lower()):
+        return text
+    return f"{name}. {text}"
+
 def play_item(item, cfg):
     # Muted: skip synthesis and audio, but still consume the item, so the queue
     # drains instead of growing into a backlog of unheard answers.
     if is_muted():
         return
     cfg = load_config()  # read now, so a speed change applies to this item
+    spoken = speech_text_with_origin(item["text"], item.get("origin", ""))
     try:
         asyncio.run(speak_text(
-            item["text"],
+            spoken,
             item.get("voice") or cfg["VOICE"],
             cfg["RATE"],
             cfg["VOLUME"],
@@ -1017,7 +1074,14 @@ def get_selected_text_via_applescript():
         return ""
 
 def has_devanagari(text: str) -> bool:
-    return any("\u0900" <= char <= "\u097f" for char in text)
+    """True when text contains Devanagari words (>=2 letters), ignoring stray punctuation."""
+    letters = 0
+    for char in text:
+        if ("\u0904" <= char <= "\u0939") or ("\u0958" <= char <= "\u0961"):
+            letters += 1
+            if letters >= 2:
+                return True
+    return False
 
 def select_voice(text: str, default_voice: str, hindi_voice: str = "hi-IN-MadhurNeural") -> str:
     """Devanagari text is read by the Hindi voice, everything else by the default."""
@@ -1113,6 +1177,26 @@ def audio_player(ext: str, platform=None, which=shutil.which):
                 return [path] + argv[1:]
     return None
 
+def player_with_volume(player_argv, volume_percent: int):
+    """Apply per-app playback volume flags without touching system audio output."""
+    pct = max(0, min(100, int(volume_percent)))
+    if not player_argv or pct >= 100:
+        return list(player_argv)
+    scale = app_volume_scale(pct)
+    name = os.path.basename(player_argv[0])
+    args = list(player_argv)
+    if name == "afplay":
+        return args + ["-v", f"{scale:g}"]
+    if name == "paplay":
+        return args + [f"--volume={round(65536 * scale)}"]
+    if name == "pw-play":
+        return args + [f"--volume={scale:g}"]
+    if name == "ffplay":
+        return args + ["-volume", str(pct)]
+    if name == "mpv":
+        return args + [f"--volume={pct}"]
+    return args
+
 def engine_ext(engine: str) -> str:
     return {"edge": "mp3", "apple": "m4a"}.get(engine, "wav")
 
@@ -1135,7 +1219,7 @@ def rate_to_wpm(rate: str):
         return None
     return max(90, min(420, round(175 * (1 + percent / 100))))
 
-def say_args(text: str, rate: str, voice: str = ""):
+def say_args(text: str, rate: str, voice: str = "", volume: int = 100):
     """`say` command line for the same text; Edge's +N% becomes words per minute."""
     args = ["/usr/bin/say"]
     if voice:
@@ -1143,6 +1227,9 @@ def say_args(text: str, rate: str, voice: str = ""):
     wpm = rate_to_wpm(rate)
     if wpm:
         args += ["-r", str(wpm)]
+    pct = max(0, min(100, int(volume)))
+    if pct < 100:
+        text = f"[[volm {app_volume_scale(pct):g}]] {text}"
     args.append(text)
     return args
 
@@ -1250,10 +1337,15 @@ def play_child(argv, temp_path=None):
 CACHE_DIR = os.path.join(STATE_DIR, "cache")
 CACHE_KEEP = 60
 
-def split_chunks(text: str):
-    """Sentence groups: a short first part so sound starts fast, then larger
-    parts. Each part is made while the one before it is playing."""
-    sentences = re.split(r'(?<=[.!?\u0964])\s+', text.strip())
+def split_chunks(text: str, engine: str = "apple"):
+    """Sentence groups: for Edge, 4 sentences per part (last chunk may be
+    smaller) for natural intonation; for local engines, a short first part
+    (160 chars) then 250-char parts."""
+    sentences = [s for s in re.split(r'(?<=[.!?\u0964])\s+', text.strip()) if s]
+    if not sentences:
+        return [text]
+    if engine == "edge":
+        return [" ".join(sentences[i:i + 4]) for i in range(0, len(sentences), 4)]
     chunks, cur = [], ""
     for s in sentences:
         limit = 160 if not chunks else 250
@@ -1309,7 +1401,8 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
     be made is read directly by `say`."""
     engine = resolve_engine(engine, piper_ready=not IS_MAC and piper_ready(piper_model))
     if engine == "say":
-        play_child(say_args(text, rate))
+        vol = app_volume_percent(load_config().get("APP_VOLUME", "100"))
+        play_child(say_args(text, rate, volume=vol))
         return
 
     player = audio_player(engine_ext(engine))
@@ -1388,11 +1481,14 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
     folder = cache_folder(text, voice)
     os.makedirs(folder, exist_ok=True)
     os.utime(folder, None)
-    chunks = split_chunks(text)
+    chunks = split_chunks(text, engine)
     total = len(chunks)
 
     def live_rate():
         return load_config().get("RATE", rate)
+
+    def live_volume():
+        return app_volume_percent(load_config().get("APP_VOLUME", "100"))
 
     def part_path(i, r):
         return os.path.join(folder, f"{i:04d}_{r}.{ext}")
@@ -1434,14 +1530,15 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
         while True:
             item = peek_next()
             r = live_rate()
-            if item and (item["text"], r) != done_for:
-                v = voice_for(item["text"], item.get("voice") or voice)
-                path = os.path.join(cache_folder(item["text"], v), f"0000_{r}.{ext}")
+            spoken = speech_text_with_origin(item["text"], item.get("origin", "")) if item else ""
+            if item and (spoken, r) != done_for:
+                v = voice_for(spoken, item.get("voice") or voice)
+                path = os.path.join(cache_folder(spoken, v), f"0000_{r}.{ext}")
                 if not (os.path.exists(path) and os.path.getsize(path) > 0):
                     os.makedirs(os.path.dirname(path), exist_ok=True)
                     tmp = path + f".{os.getpid()}.{os.urandom(3).hex()}.part"
                     try:
-                        first = split_chunks(item["text"])[0]
+                        first = split_chunks(spoken, engine)[0]
                         await synth(first, v, r, tmp)
                         if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
                             os.replace(tmp, path)
@@ -1450,13 +1547,13 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                     finally:
                         if os.path.exists(tmp):
                             os.remove(tmp)
-                done_for = (item["text"], r)
+                done_for = (spoken, r)
             await asyncio.sleep(0.3)
 
     producer = asyncio.create_task(produce())
     prefetcher = asyncio.create_task(prefetch_next())
 
-    current = {"proc": None}
+    current = {"proc": None, "helper": False}
 
     def handle_signal(sig, frame):
         proc = current["proc"]
@@ -1470,6 +1567,35 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
 
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+
+    def has_audio_helper():
+        return IS_MAC and os.path.isfile(AUDIO_BINARY) and os.access(AUDIO_BINARY, os.X_OK)
+
+    async def ensure_helper():
+        proc = current["proc"]
+        if proc is not None and proc.returncode is None:
+            return proc
+        proc = await asyncio.create_subprocess_exec(
+            AUDIO_BINARY,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        current["proc"] = proc
+        current["helper"] = True
+        with open(AFPLAY_PID_FILE, "w") as f:
+            f.write(str(proc.pid))
+        return proc
+
+    async def wait_part_gap():
+        deadline = time.monotonic() + PART_GAP
+        while True:
+            if _should_abort() or os.path.exists(SEEK_FILE):
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return True
+            await asyncio.sleep(min(0.05, remaining))
 
     try:
         index = 0
@@ -1500,7 +1626,7 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                     path = await fetch(index, r)
                     if path is None:
                         if index == 0 and engine == "apple":
-                            play_child(say_args(text, r, voice))
+                            play_child(say_args(text, r, voice, volume=live_volume()))
                         return
                 else:
                     # The producer is fetching this part at this rate: wait for it.
@@ -1513,7 +1639,7 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
                             path = await fetch(index, r)
                             if path is None:
                                 if index == 0 and engine == "apple":
-                                    play_child(say_args(text, r, voice))
+                                    play_child(say_args(text, r, voice, volume=live_volume()))
                                 return
                             break
                         await asyncio.sleep(0.05)
@@ -1521,18 +1647,61 @@ async def speak_text(text: str, voice: str, rate: str, volume: str, pitch: str,
             # to the loop top, which moves to the new part or holds.
             if os.path.exists(SEEK_FILE) or os.path.exists(PAUSED_FLAG):
                 continue
-            proc = await asyncio.create_subprocess_exec(*player, path, **player_io)
-            current["proc"] = proc
-            with open(AFPLAY_PID_FILE, "w") as f:
-                f.write(str(proc.pid))
-            await proc.wait()
-            current["proc"] = None
-            if os.path.exists(SEEK_FILE) and not _should_abort():
-                continue  # killed by a seek: the loop top moves to the new part
-            if proc.returncode != 0 or _should_abort():
-                return  # killed by Next / Previous / Stop / Mute
+            if has_audio_helper():
+                proc = await ensure_helper()
+                vol = app_volume_scale(live_volume())
+                try:
+                    proc.stdin.write(f"{vol:g}\t{path}\n".encode())
+                    await proc.stdin.drain()
+                    reply = await proc.stdout.readline()
+                except Exception:
+                    reply = b""
+                ok = reply.strip() == b"done"
+                if not ok:
+                    current["proc"] = None
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=0.2)
+                    except Exception:
+                        pass
+                if os.path.exists(SEEK_FILE) and not _should_abort():
+                    continue  # killed by a seek: the loop top moves to the new part
+                if not ok or _should_abort():
+                    return  # killed by Next / Previous / Stop / Mute
+            else:
+                cmd = player_with_volume(player, live_volume())
+                proc = await asyncio.create_subprocess_exec(*cmd, path, **player_io)
+                current["proc"] = proc
+                current["helper"] = False
+                with open(AFPLAY_PID_FILE, "w") as f:
+                    f.write(str(proc.pid))
+                await proc.wait()
+                current["proc"] = None
+                if os.path.exists(SEEK_FILE) and not _should_abort():
+                    continue  # killed by a seek: the loop top moves to the new part
+                if proc.returncode != 0 or _should_abort():
+                    return  # killed by Next / Previous / Stop / Mute
             index += 1
+            if index < total and not await wait_part_gap():
+                if os.path.exists(SEEK_FILE) and not _should_abort():
+                    continue
+                return
     finally:
+        proc = current["proc"]
+        if proc and proc.returncode is None:
+            if current["helper"] and proc.stdin:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=0.3)
+                except Exception:
+                    pass
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
         prefetcher.cancel()
         if producer and not producer.done():
             producer.cancel()
@@ -1597,6 +1766,25 @@ def main():
 
     if "--rate-down" in args:
         print(adjust_rate(-10))
+        sys.exit(0)
+
+    if "--volume" in args:
+        position = args.index("--volume") + 1
+        try:
+            raw = args[position]
+            float(raw.rstrip("%"))
+        except (IndexError, ValueError):
+            print("zero-eyes: --volume needs a percentage (0-100)", file=sys.stderr)
+            sys.exit(2)
+        print(adjust_volume(target=raw))
+        sys.exit(0)
+
+    if "--volume-up" in args:
+        print(adjust_volume(delta=10))
+        sys.exit(0)
+
+    if "--volume-down" in args:
+        print(adjust_volume(delta=-10))
         sys.exit(0)
 
     if not IS_MAC and any(a.startswith("--reply") for a in args):

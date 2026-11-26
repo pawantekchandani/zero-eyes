@@ -105,7 +105,8 @@ The overlay appears with the first thing spoken and can be dragged anywhere; it 
 | 🎤 | reply by voice: press to start, press again to send |
 | ⌃ / ⌄ | collapse to a small pill |
 | Send to Dock | minimize the overlay to the Dock; click the Dock icon to bring it back |
-| ✕ | quit the overlay |
+| ✕ | menu to **Run permanently minimized** (starts minimized in Dock across launches), **Minimize to Dock now**, or **Close overlay** |
+| Volume slider | per-app playback volume (0–100%); only changes Zero Eyes's own audio, not Mac system volume |
 
 Buttons redraw at once on click; the player catches up in the background.
 
@@ -116,6 +117,7 @@ printf '%s' "text" | zero-eyes   # queue it
 zero-eyes --now                  # state as one JSON line
 zero-eyes --stop | --pause | --mute | --next | --previous | --replay
 zero-eyes --rate-up | --rate-down
+zero-eyes --volume 75 | --volume-up | --volume-down
 zero-eyes --reply                # start a voice reply; run again to send
 ```
 

@@ -20,6 +20,7 @@ DIST="$ROOT/dist"
 WORK="$(mktemp -d)"
 APP="$WORK/Zero Eyes Overlay.app"
 BINARY="$APP/Contents/MacOS/ZeroEyesOverlay"
+AUDIO_BINARY="$APP/Contents/MacOS/ZeroEyesAudio"
 
 ZERO_EYES_OVERLAY_APP="$APP" "$ROOT/overlay/build.sh" >/dev/null
 # Same SDK rule as build.sh: the newest SDK that this swiftc can compile with.
@@ -29,11 +30,14 @@ for SDK in "${sdks[@]}"; do
   for arch in arm64 x86_64; do
     swiftc -O -swift-version 5 -sdk "$SDK" -target "$arch-apple-macos13.0" \
       "$ROOT/overlay/Overlay.swift" -o "$WORK/overlay-$arch" 2>/dev/null || { ok=0; break; }
+    swiftc -O -swift-version 5 -sdk "$SDK" -target "$arch-apple-macos13.0" \
+      "$ROOT/overlay/AudioPlayer.swift" -o "$WORK/audio-$arch" 2>/dev/null || { ok=0; break; }
   done
   [[ $ok -eq 1 ]] && break
 done
 [[ $ok -eq 1 ]] || { echo "No installed SDK builds both architectures." >&2; exit 1; }
 lipo -create "$WORK/overlay-arm64" "$WORK/overlay-x86_64" -output "$BINARY"
+lipo -create "$WORK/audio-arm64" "$WORK/audio-x86_64" -output "$AUDIO_BINARY"
 SIGN_ID="${ZERO_EYES_SIGN_ID:-}"
 NOTARY_PROFILE="${ZERO_EYES_NOTARY_PROFILE:-}"
 if [[ -n "$NOTARY_PROFILE" && -z "$SIGN_ID" ]]; then

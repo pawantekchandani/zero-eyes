@@ -72,6 +72,7 @@ install_player() {
 VOICE="en-IN-PrabhatNeural"
 RATE="+20%"
 VOLUME="+0%"
+APP_VOLUME="100"
 PITCH="+0Hz"
 AUTO_READ="true"
 MUTED="false"

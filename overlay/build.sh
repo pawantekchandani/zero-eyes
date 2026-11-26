@@ -12,8 +12,10 @@ set -euo pipefail
 
 HERE="${0:A:h}"
 SRC="$HERE/Overlay.swift"
+AUDIO_SRC="$HERE/AudioPlayer.swift"
 APP="${ZERO_EYES_OVERLAY_APP:-$HOME/Applications/Zero Eyes Overlay.app}"
 BINARY="$APP/Contents/MacOS/ZeroEyesOverlay"
+AUDIO_BINARY="$APP/Contents/MacOS/ZeroEyesAudio"
 
 mkdir -p "$APP/Contents/MacOS"
 
@@ -53,7 +55,8 @@ built=0
 for sdk in "${candidates[@]}"; do
   args=(-O -swift-version 5 -target "$(uname -m)-apple-macos13.0")
   [[ -n "$sdk" ]] && args+=(-sdk "$sdk")
-  if swiftc "${args[@]}" "$SRC" -o "$BINARY" 2>/dev/null; then
+  if swiftc "${args[@]}" "$SRC" -o "$BINARY" 2>/dev/null \
+     && swiftc "${args[@]}" "$AUDIO_SRC" -o "$AUDIO_BINARY" 2>/dev/null; then
     built=1
     [[ -n "$sdk" ]] && echo "SDK         $sdk"
     break

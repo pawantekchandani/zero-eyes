@@ -8,6 +8,7 @@
 VOICE="en-IN-PrabhatNeural"
 RATE="+20%"
 VOLUME="+0%"
+APP_VOLUME="100"
 PITCH="+0Hz"
 AUTO_READ="true"
 MUTED="false"
@@ -23,6 +24,7 @@ APPLE_VOICE=""
 | `VOICE` | Edge Read Aloud voice. `edge-tts --list-voices` lists them; Devanagari text switches to `hi-IN-MadhurNeural` on its own. |
 | `RATE` | Rate, `+/-N%`, for every engine; for Apple voices `+0%` is 175 words per minute. `-` and `+` in the overlay move it in 10% steps. |
 | `VOLUME` | Edge volume, `+/-N%`. |
+| `APP_VOLUME` | Per-app playback volume (`0`–`100`, default `100`). Applied only to Zero Eyes's audio player (`afplay` / Linux player), never Mac system volume. |
 | `PITCH` | Edge pitch, `+/-NHz`. |
 | `MUTED` | Start muted. The overlay's speaker button flips this. |
 | `AUTO_READ` | Whether the OpenCode plugin starts reading on its own. |
@@ -39,6 +41,7 @@ Environment overrides, handy for testing:
 | `ZERO_EYES_ENGINE` | `apple` / `edge` / `say` |
 | `ZERO_EYES_VOICE` | Voice |
 | `ZERO_EYES_RATE` | Rate |
+| `ZERO_EYES_APP_VOLUME` | Per-app playback volume (`0`–`100`) |
 | `ZERO_EYES_ORIGIN` | The app name the overlay shows |
 | `ZERO_EYES_OVERLAY_APP` | Where `overlay/build.sh` writes the app bundle |
 

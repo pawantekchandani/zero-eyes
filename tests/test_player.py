@@ -58,6 +58,26 @@ class SplitChunksTests(unittest.TestCase):
         self.assertTrue(all(len(c) <= 250 for c in chunks[1:]))
         self.assertEqual(" ".join(chunks), " ".join([sentence] * 20))
 
+    def test_edge_groups_four_sentences_per_part(self):
+        sentences = [f"Sentence {i}." for i in range(1, 11)]
+        chunks = ze.split_chunks(" ".join(sentences), engine="edge")
+        self.assertEqual(len(chunks), 3)
+        self.assertEqual(chunks[0], "Sentence 1. Sentence 2. Sentence 3. Sentence 4.")
+        self.assertEqual(chunks[1], "Sentence 5. Sentence 6. Sentence 7. Sentence 8.")
+        self.assertEqual(chunks[2], "Sentence 9. Sentence 10.")
+
+        short = ze.split_chunks("One. Two. Three.", engine="edge")
+        self.assertEqual(short, ["One. Two. Three."])
+
+    def test_speech_text_with_origin(self):
+        self.assertEqual(ze.speech_text_with_origin("Done.", "Antigravity"), "Antigravity. Done.")
+        self.assertEqual(ze.speech_text_with_origin("Done.", "Claude!"), "Claude. Done.")
+        self.assertEqual(ze.speech_text_with_origin("Antigravity is ready.", "Antigravity"),
+                         "Antigravity is ready.")
+        self.assertEqual(ze.speech_text_with_origin("Done.", "Read aloud"), "Done.")
+        self.assertEqual(ze.speech_text_with_origin("Done.", "Zero Eyes"), "Done.")
+        self.assertEqual(ze.speech_text_with_origin("Done.", ""), "Done.")
+
 
 class EngineTests(unittest.TestCase):
     def test_named_engines_are_kept(self):
@@ -252,6 +272,13 @@ class AppleVoiceTests(unittest.TestCase):
         self.assertEqual(ze.apple_voice_for("नमस्ते", "", voices),
                          "com.apple.voice.premium.en-US.Zoe")
 
+    def test_stray_devanagari_punctuation_keeps_english_voice(self):
+        self.assertFalse(ze.has_devanagari("Split on regex । and speak 1 2 3."))
+        self.assertEqual(ze.select_voice("Split on regex । and speak 1 2 3.", "en-IN-PrabhatNeural"),
+                         "en-IN-PrabhatNeural")
+        self.assertEqual(ze.select_voice("नमस्ते दुनिया", "en-IN-PrabhatNeural"),
+                         "hi-IN-MadhurNeural")
+
 
 class QueueCapTests(unittest.TestCase):
     def setUp(self):
@@ -320,6 +347,50 @@ class ReplyTests(unittest.TestCase):
         self.assertEqual(saved["MUTED"], "true")
         self.assertEqual(saved["REPLY_SUBMIT"], "true")
         self.assertEqual(saved["REPLY_LANGUAGE"], "hi")
+
+
+class AppVolumeTests(unittest.TestCase):
+    def test_percent_parsing_and_clamping(self):
+        self.assertEqual(ze.app_volume_percent("100"), 100)
+        self.assertEqual(ze.app_volume_percent("65%"), 65)
+        self.assertEqual(ze.app_volume_percent("-10"), 0)
+        self.assertEqual(ze.app_volume_percent("250"), 100)
+        self.assertEqual(ze.app_volume_percent("bogus"), 100)
+
+    def test_scale_curve(self):
+        self.assertEqual(ze.app_volume_scale(0), 0.0)
+        self.assertEqual(ze.app_volume_scale(50), 0.25)
+        self.assertEqual(ze.app_volume_scale(100), 1.0)
+
+    def test_player_with_volume_applies_only_to_player(self):
+        self.assertEqual(ze.player_with_volume(["/usr/bin/afplay"], 100), ["/usr/bin/afplay"])
+        self.assertEqual(ze.player_with_volume(["/usr/bin/afplay"], 50),
+                         ["/usr/bin/afplay", "-v", "0.25"])
+        self.assertEqual(ze.player_with_volume(["/usr/bin/afplay"], 0),
+                         ["/usr/bin/afplay", "-v", "0"])
+        self.assertEqual(ze.player_with_volume(["/usr/bin/mpv", "--no-video"], 40),
+                         ["/usr/bin/mpv", "--no-video", "--volume=40"])
+
+    def test_say_args_with_volume(self):
+        self.assertEqual(ze.say_args("hi", "+0%", volume=100), ["/usr/bin/say", "-r", "175", "hi"])
+        self.assertEqual(ze.say_args("hi", "+0%", volume=50),
+                         ["/usr/bin/say", "-r", "175", "[[volm 0.25]] hi"])
+
+    def test_adjust_volume_persists_without_losing_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config")
+            with open(path, "w") as f:
+                f.write('RATE="+20%"\nREPLY_SUBMIT="true"\n')
+            with mock.patch.object(ze, "CONFIG_FILE", path):
+                self.assertEqual(ze.adjust_volume(target=60), "60%")
+                self.assertEqual(ze.adjust_volume(delta=-15), "45%")
+                self.assertEqual(ze.adjust_volume(delta=-90), "0%")
+                self.assertEqual(ze.adjust_volume(delta=150), "100%")
+                self.assertEqual(ze.adjust_volume(target=75), "75%")
+                cfg = ze.load_config()
+        self.assertEqual(cfg["APP_VOLUME"], "75")
+        self.assertEqual(cfg["RATE"], "+20%")
+        self.assertEqual(cfg["REPLY_SUBMIT"], "true")
 
 
 if __name__ == "__main__":
