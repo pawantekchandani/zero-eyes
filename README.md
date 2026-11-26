@@ -64,7 +64,7 @@ cd zero-eyes
 scripts/install.sh
 ```
 
-That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, and copies the three macOS Services.
+That installs the player to `~/.local/bin/zero-eyes`, builds (or downloads) and starts the overlay, adds the login agent, wires the Claude Code Stop hook, links the OpenCode plugin, adds the Antigravity watcher (when `~/.gemini/antigravity` exists), and copies the three macOS Services.
 
 Install one piece at a time with `scripts/install.sh --only player|overlay|launchagent|claude-code|opencode|antigravity|services`.
 
@@ -140,12 +140,12 @@ a rebuild macOS may ask again.
 - **Tables are read aloud.** Each row is spoken as `Header: value, Header: value.`, between "Table." and "End of table.", instead of being skipped.
 - **Fast start & natural Edge intonation.** Local engines split into a short 160-character first part then 250-character parts so sound starts fast; `ENGINE="edge"` groups **4 sentences per part** (smaller final chunk) to keep Microsoft Edge's modulation natural.
 - **Crisp 0.2 s gap between parts.** On macOS, a persistent `AVFoundation` audio helper (`ZeroEyesAudio`) trims leading/trailing TTS silence and plays parts back-to-back with a ~0.2 s pause instead of re-opening audio per part.
-- **Jump by sentence.** A stepped seek slider in the overlay (and `zero-eyes --seek N`) lets you jump forward or back across parts of the playing or paused answer.
+- **Jump by sentence.** A stepped seek slider in the overlay (and `zero-eyes --seek N`) lets you jump forward or back across parts of the current answer; a paused answer stays paused at the new part.
 - **Per-app volume control.** Adjust Zero Eyes's own playback volume (0–100%) from the overlay slider or `--volume` flags without changing macOS's system output volume.
 - **Spoken app prefix.** Each answer begins by speaking the source app name (for example `Antigravity.` or `Claude.`), so you know where it came from without looking.
 - **Instant Previous and Replay.** Fetched parts are cached in the state folder (the newest 60 answers), so a replayed answer starts at once.
 - **Live speed change.** Each part is fetched at the rate set at that moment, so − / + changes the answer that is playing, not only the next one.
-- **No gap between answers.** While one answer plays, the first part of the next waiting answer is fetched, so the next answer starts right after the last one ends.
+- **Clean pause between answers.** While one answer plays, the first part of the next waiting answer is pre-fetched, so the next answer starts cleanly after a ~1 s pause.
 - **Responsive, color-coded overlay.** Play, Pause, Stop, Next, Previous, Mute, Speed, Volume and Mic show their role and live state with distinct semantic colors as soon as they are clicked.
 - **Dock & permanent minimize.** Minimize to the Dock for now, or enable **Run permanently minimized** under the `✕` menu so the overlay stays hidden in the Dock across launches and new speech.
 

@@ -72,6 +72,8 @@ AUDIO_BINARY = os.path.join(OVERLAY_APP, "Contents", "MacOS", "ZeroEyesAudio")
 # ZeroEyesAudio trims leading/trailing TTS silence to ~0.05s total; sleeping
 # 0.12s + ~0.03s schedule overhead yields a ~0.20s audible gap between parts.
 PART_GAP = 0.12
+# Distinct pause between two completely different answers in the queue.
+ANSWER_GAP = 1.0
 
 def ensure_state_dir():
     """State is per-user and private: create it mode 700 before first write."""
@@ -926,6 +928,21 @@ def play_item(item, cfg):
     except Exception:
         pass
 
+def wait_answer_gap():
+    """Pause briefly between two separate queued answers; wakes early on nav or mute."""
+    deadline = time.monotonic() + ANSWER_GAP
+    while True:
+        if os.path.exists(NAV_FILE) or is_muted():
+            return
+        if os.path.exists(PAUSED_FLAG):
+            time.sleep(0.05)
+            deadline = time.monotonic() + 0.05
+            continue
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.05, remaining))
+
 def drain():
     """Play queued items in arrival order, one at a time."""
     ensure_state_dir()
@@ -964,6 +981,8 @@ def drain():
                         debug(f"worker {os.getpid()} {nav} ({item['text'][:40]!r})")
                         play_item(item, cfg)
                         clear_now()
+                        if peek_next() is not None and not os.path.exists(NAV_FILE):
+                            wait_answer_gap()
                         continue
                 elif nav != "next":
                     continue
@@ -976,6 +995,8 @@ def drain():
             debug(f"worker {os.getpid()} play waiting={queue_size()} ({item['text'][:40]!r})")
             play_item(item, cfg)
             clear_now()
+            if peek_next() is not None and not os.path.exists(NAV_FILE):
+                wait_answer_gap()
     finally:
         clear_now()
         try:

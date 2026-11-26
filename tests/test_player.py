@@ -78,6 +78,22 @@ class SplitChunksTests(unittest.TestCase):
         self.assertEqual(ze.speech_text_with_origin("Done.", "Zero Eyes"), "Done.")
         self.assertEqual(ze.speech_text_with_origin("Done.", ""), "Done.")
 
+    def test_drain_waits_answer_gap_between_separate_answers(self):
+        ze.clear_queue()
+        with mock.patch.object(ze, "detect_origin", return_value="Antigravity"):
+            ze.enqueue("First answer.", "voice")
+            ze.enqueue("Second answer.", "voice")
+        calls = []
+        with mock.patch.object(ze, "ensure_overlay"), \
+             mock.patch.object(ze, "play_item", side_effect=lambda item, cfg: calls.append(("play", item["text"]))), \
+             mock.patch.object(ze, "wait_answer_gap", side_effect=lambda: calls.append(("gap", ze.ANSWER_GAP))):
+            ze.drain()
+        self.assertEqual(calls, [
+            ("play", "First answer."),
+            ("gap", ze.ANSWER_GAP),
+            ("play", "Second answer."),
+        ])
+
 
 class EngineTests(unittest.TestCase):
     def test_named_engines_are_kept(self):
