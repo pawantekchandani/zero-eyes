@@ -19,9 +19,9 @@ Reads your AI coding agent's answers aloud on macOS, so you can look away from t
 <p align="center"><a href="docs/demo.mp4">Watch the demo with sound</a></p>
 
 - **Speaks the answer, not your screen.** Each finished answer is read once, from the text the agent actually produced.
-- **One shared queue.** Claude Code, OpenCode and any text you select can all speak through the same player; the newest three wait, the rest are dropped so nothing goes stale.
-- **A floating bar you can actually use.** Pause, stop, step through recent answers, change speed, or mute everything while the queue keeps draining silently.
-- **Knows which app is talking.** The first line names the app the speech came from: `Claude`, `T3 Code`, `OpenCode`, `Google Chrome`, and so on.
+- **One shared queue.** Claude Code, OpenCode, Antigravity and any text you select can all speak through the same player; the newest three wait, the rest are dropped so nothing goes stale.
+- **A floating bar you can actually use.** Pause, stop, step through recent answers, jump by sentence, change speed, adjust app volume, or mute everything while the queue keeps draining silently.
+- **Knows which app is talking.** Names the app at the start of speech and on the overlay's first line (`Antigravity`, `Claude`, `T3 Code`, `OpenCode`, `Google Chrome`, and so on).
 - **Select text and press a key.** A macOS Service reads the selection in any app.
 - **Reply by voice.** Press the reply shortcut, speak, and your words are transcribed on this Mac and pasted into the app in front.
 
@@ -106,9 +106,10 @@ The overlay appears with the first thing spoken and can be dragged anywhere; it 
 | ⌃ / ⌄ | collapse to a small pill |
 | Send to Dock | minimize the overlay to the Dock; click the Dock icon to bring it back |
 | ✕ | menu to **Run permanently minimized** (starts minimized in Dock across launches), **Minimize to Dock now**, or **Close overlay** |
+| Seek slider | drag to jump forward or back by part/sentence inside the current answer |
 | Volume slider | per-app playback volume (0–100%); only changes Zero Eyes's own audio, not Mac system volume |
 
-Buttons redraw at once on click; the player catches up in the background.
+Buttons redraw at once on click with role- and state-based colors; the player catches up in the background.
 
 From the terminal:
 
@@ -116,6 +117,7 @@ From the terminal:
 printf '%s' "text" | zero-eyes   # queue it
 zero-eyes --now                  # state as one JSON line
 zero-eyes --stop | --pause | --mute | --next | --previous | --replay
+zero-eyes --seek 2               # jump to 0-based part N of current answer
 zero-eyes --rate-up | --rate-down
 zero-eyes --volume 75 | --volume-up | --volume-down
 zero-eyes --reply                # start a voice reply; run again to send
@@ -136,12 +138,16 @@ a rebuild macOS may ask again.
 ## Features
 
 - **Tables are read aloud.** Each row is spoken as `Header: value, Header: value.`, between "Table." and "End of table.", instead of being skipped.
-- **Fast start.** An answer is fetched in parts: a short first part, then parts of about 250 characters. Sound starts after the first part, and later parts are fetched while earlier ones play.
+- **Fast start & natural Edge intonation.** Local engines split into a short 160-character first part then 250-character parts so sound starts fast; `ENGINE="edge"` groups **4 sentences per part** (smaller final chunk) to keep Microsoft Edge's modulation natural.
+- **Crisp 0.2 s gap between parts.** On macOS, a persistent `AVFoundation` audio helper (`ZeroEyesAudio`) trims leading/trailing TTS silence and plays parts back-to-back with a ~0.2 s pause instead of re-opening audio per part.
+- **Jump by sentence.** A stepped seek slider in the overlay (and `zero-eyes --seek N`) lets you jump forward or back across parts of the playing or paused answer.
+- **Per-app volume control.** Adjust Zero Eyes's own playback volume (0–100%) from the overlay slider or `--volume` flags without changing macOS's system output volume.
+- **Spoken app prefix.** Each answer begins by speaking the source app name (for example `Antigravity.` or `Claude.`), so you know where it came from without looking.
 - **Instant Previous and Replay.** Fetched parts are cached in the state folder (the newest 60 answers), so a replayed answer starts at once.
 - **Live speed change.** Each part is fetched at the rate set at that moment, so − / + changes the answer that is playing, not only the next one.
-- **No gap between answers.** While one answer plays, the first part of the next waiting answer is fetched, so the next answer starts about 0.05 s after the last one ends.
-- **Responsive overlay.** Play, Pause, Stop, Next and Previous show their new state as soon as they are clicked.
-- **Dock.** The overlay has a Dock icon and a Send to Dock button, so it can be hidden and brought back.
+- **No gap between answers.** While one answer plays, the first part of the next waiting answer is fetched, so the next answer starts right after the last one ends.
+- **Responsive, color-coded overlay.** Play, Pause, Stop, Next, Previous, Mute, Speed, Volume and Mic show their role and live state with distinct semantic colors as soon as they are clicked.
+- **Dock & permanent minimize.** Minimize to the Dock for now, or enable **Run permanently minimized** under the `✕` menu so the overlay stays hidden in the Dock across launches and new speech.
 
 ## How it compares
 
@@ -150,8 +156,8 @@ a rebuild macOS may ask again.
 | Price | Free, MIT | Free, MIT | Paid Pro tier, uses voice credits |
 | What is read | Every full answer, automatically | A short summary per answer; a hotkey reads the full answer | The last answer, a selection or a file, on click; optional AI summary |
 | Where speech is made | On your Mac (Apple voices) by default; Edge voices optional | On your Mac | On AgentsRoom servers; no offline voice |
-| Agents | Claude Code, OpenCode, any app through a macOS Service | Claude Code, Codex | Agents run inside the AgentsRoom app |
-| Controls | Floating bar: pause, stop, previous, next, speed, mute; shared queue | Hotkeys | Speaker button with progress, pause and stop |
+| Agents | Claude Code, OpenCode, Antigravity, any app through a macOS Service | Claude Code, Codex | Agents run inside the AgentsRoom app |
+| Controls | Floating bar: pause, stop, previous, next, seek, speed, app volume, mute; shared queue | Hotkeys | Speaker button with progress, pause and stop |
 | Reply by voice | Yes, transcribed on your Mac | No | Separate dictation feature |
 | Platforms | macOS; Linux player | macOS | AgentsRoom desktop app |
 
@@ -181,7 +187,8 @@ Per-session rules (speak only certain roles, mute a session) are configuration, 
 | `APPLE_VOICE` | empty | Apple voice name or identifier; empty = the best installed English voice (Premium, then Enhanced, then the system voice) |
 | `VOICE` | `en-IN-PrabhatNeural` | Edge voice; `edge-tts --list-voices` shows all |
 | `RATE` | `+0%` | speaking rate, for every engine |
-| `VOLUME` | `+0%` | Edge volume |
+| `VOLUME` | `+0%` | Edge synthesis volume |
+| `APP_VOLUME` | `100` | per-app playback volume (`0`–`100`); does not change Mac system volume |
 | `PITCH` | `+0Hz` | Edge pitch |
 | `MUTED` | `false` | muted at start |
 | `AUTO_READ` | `true` | whether OpenCode auto-read starts on |
